@@ -1,0 +1,28 @@
+# clangd configuration for the kernel module sources.
+#
+# Workflow: generate compile_commands.json by running `make compile-db`
+# from kernel/dev/ (which runs `bear -- make module` inside the container).
+# That file lives at kernel/compile_commands.json. clangd will pick it up.
+#
+# The Add: entries make clangd think we're in kernel-build context
+# (otherwise __KERNEL__, MODULE etc. aren't defined and most kernel headers
+# look broken). The Remove: entries strip flags clang doesn't understand
+# (the kernel build uses some gcc-specific -m options).
+
+CompileFlags:
+  Add:
+    - -D__KERNEL__
+    - -DMODULE
+    - -nostdinc
+  Remove:
+    - -mpreferred-stack-boundary=*
+    - -mindirect-branch=*
+    - -mindirect-branch-register
+    - -mfunction-return=*
+    - -fno-allow-store-data-races
+    - -fconserve-stack
+    - -fmacro-prefix-map=*
+
+Diagnostics:
+  Suppress:
+    - missing-includes

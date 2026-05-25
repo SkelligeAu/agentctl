@@ -1,0 +1,12 @@
+src/
+share/
+.ccache/
+*.ko
+*.o
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+compile_commands.json

@@ -1,0 +1,31 @@
+# Convenience layer over `docker run`. The Makefile uses plain `docker run`
+# so you don't *need* compose, but if you prefer `docker compose run kdev`
+# that's what this gives you.
+#
+# `/dev/kvm` is commented out: uncomment on a Linux host that exposes it
+# (and the host user is in the `kvm` group). On macOS / Windows Docker
+# Desktop it's not available; QEMU then runs in TCG (slower but works).
+
+services:
+  kdev:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: kdev:latest
+    container_name: kdev
+    hostname: kdev
+    init: true
+    # devices:
+    #   - /dev/kvm:/dev/kvm
+    volumes:
+      - ../..:/work                     # entire project at /work
+      - kdev-ccache:/work/dev/.ccache
+    working_dir: /work/kernel/dev
+    stdin_open: true
+    tty: true
+    command: ["/bin/bash"]
+
+volumes:
+  kdev-ccache:

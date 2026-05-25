@@ -1,0 +1,86 @@
+# ─── compiled binaries (root) ────────────────────────────────────────
+agentctl
+agentd
+reviewer-agent
+fanout-agent
+psa
+broker-test
+broker-fault
+
+# ─── object files / archives ─────────────────────────────────────────
+*.o
+*.a
+*.so
+*.dylib
+
+# ─── compiled test binaries (sources stay) ──────────────────────────
+tests/test_ipc_msg_trunc
+tests/test_ipc_msg_ctrunc
+tests/test_cloexec
+
+# ─── compiled bench binary (source stays) ───────────────────────────
+bench/bench-pingpong
+
+# ─── kernel module build outputs ────────────────────────────────────
+kernel/agentfs.ko
+kernel/agentfs.mod
+kernel/agentfs.mod.c
+kernel/agentfs.mod.o
+kernel/agentfs.o
+kernel/Module.symvers
+kernel/modules.order
+kernel/.*.cmd
+kernel/.tmp_versions/
+kernel/agentfs-read
+kernel/agentfs-register
+kernel/agentfs-send
+
+# ─── QEMU dev-environment build artifacts ───────────────────────────
+# Built kernel + initramfs + extracted rootfs + userland statics
+kernel/dev/share/initramfs/
+kernel/dev/share/initramfs.cpio.gz
+kernel/dev/share/vmlinuz
+kernel/dev/share/userland/
+kernel/dev/share/agentfs.ko
+kernel/dev/share/agentfs-read
+kernel/dev/share/agentfs-register
+kernel/dev/share/agentfs-send
+kernel/dev/share/.agentfs-test.sh.bak
+# Hello-world module sample build artifacts
+kernel/dev/share/hello.ko
+# Cached upstream tarballs (alpine minirootfs etc.)
+kernel/dev/share/cache/
+# ccache between container runs
+kernel/dev/.ccache/
+# clangd compile database (regenerated via `make compile-db`)
+kernel/dev/compile_commands.json
+kernel/compile_commands.json
+
+# ─── vendored linux kernel source (3+ GB; fetched via `make fetch-kernel`)
+kernel/dev/src/
+
+# ─── IDE / editor / OS junk ─────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Claude Code local session state ────────────────────────────────
+.claude/
+
+# ─── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# ─── runtime state (defensive — these live under $AGENTCTL_ROOT, not the repo)
+*.sock
+*.pid
+agentd.log
+audit.log
