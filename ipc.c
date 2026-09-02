@@ -533,6 +533,13 @@ static int parse_inplace(char *buf, size_t total_len, ipc_msg_t *out)
     return 0;
 }
 
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+int ipc_parse_for_fuzz(char *buf, size_t len, ipc_msg_t *out_msg)
+{
+    return parse_inplace(buf, len, out_msg);
+}
+#endif
+
 #if defined(__APPLE__)
 /* macOS STREAM: read header byte-by-byte until blank line, parse LEN, read
  * payload. Fills `buf` so the same in-place parser can run. */

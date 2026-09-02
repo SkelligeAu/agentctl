@@ -7,6 +7,12 @@ BINS = agentctl agentd reviewer-agent fanout-agent psa broker-test broker-fault 
 TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec tests/phase1-probe tests/crash-agent
 LIBOBJS = common.o ipc.o broker.o profiles.o tasks.o enforcement.o
 LIB = libagentctl.a
+FUZZ_CC ?= clang
+FUZZ_CFLAGS ?= -std=c99 -O1 -g -fno-omit-frame-pointer \
+	-fsanitize=fuzzer,address,undefined \
+	-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION \
+	-D_POSIX_C_SOURCE=200809L -D_DARWIN_C_SOURCE -D_GNU_SOURCE
+FUZZ_TARGETS = tests/fuzz/fuzz-broker tests/fuzz/fuzz-ipc
 
 AR ?= ar
 
@@ -16,6 +22,17 @@ $(LIB): $(LIBOBJS)
 	$(AR) rcs $@ $(LIBOBJS)
 
 tests: $(TESTS)
+
+fuzz: $(FUZZ_TARGETS)
+
+tests/fuzz/fuzz-broker: tests/fuzz/fuzz_broker.c broker.c broker.h common.h
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -I. -o $@ tests/fuzz/fuzz_broker.c broker.c
+
+tests/fuzz/fuzz-ipc: tests/fuzz/fuzz_ipc.c ipc.c ipc.h common.c common.h \
+		broker.c broker.h profiles.c profiles.h tasks.c tasks.h \
+		enforcement.c enforcement.h
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -I. -o $@ tests/fuzz/fuzz_ipc.c \
+		ipc.c common.c broker.c profiles.c tasks.c enforcement.c
 
 agentctl: agentctl.o $(LIBOBJS)
 	$(CC) $(LDFLAGS) -o $@ agentctl.o $(LIBOBJS)
@@ -90,6 +107,6 @@ enforcement.o: enforcement.c enforcement.h common.h profiles.h
 	$(CC) $(CFLAGS) -c -o $@ enforcement.c
 
 clean:
-	rm -f $(BINS) $(TESTS) $(LIB) agentctl.o agentd.o reviewer-agent.o fanout-agent.o psa.o common.o ipc.o broker.o profiles.o tasks.o enforcement.o
+	rm -f $(BINS) $(TESTS) $(FUZZ_TARGETS) $(LIB) agentctl.o agentd.o reviewer-agent.o fanout-agent.o psa.o common.o ipc.o broker.o profiles.o tasks.o enforcement.o
 
-.PHONY: all clean tests
+.PHONY: all clean tests fuzz

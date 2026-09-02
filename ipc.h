@@ -114,6 +114,11 @@ int  ipc_send(int fd, const ipc_msg_t *msg);
  * Returns IPC_OK, IPC_ERR, IPC_PEER_GONE (EOF), or IPC_PROTO_VIOLATION. */
 int  ipc_recv(int fd, void *buf, size_t bufcap, ipc_msg_t *out_msg);
 
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+/* Exposes the production in-place frame parser only to sanitizer fuzz builds. */
+int ipc_parse_for_fuzz(char *buf, size_t len, ipc_msg_t *out_msg);
+#endif
+
 /* Convenience: connect + send + close. Builds the message frame from the
  * provided header fields and payload bytes; no caller-side buffer required.
  * Returns IPC_OK, IPC_ERR, or IPC_PEER_GONE (no listener). */

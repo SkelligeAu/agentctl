@@ -63,7 +63,22 @@ to the spawned runtime, so the file-in-cwd convention is used.
 | Lifecycle: zombie stop reaps inline | F in `agentfs-test.sh` |
 | Lifecycle: `cgroup.kill` subtree termination | F3 in `agentfs-test.sh` |
 
-12 invariants, 12 tests, no TODO.
+15 invariants, 15 tests, no TODO.
+
+## Protocol fuzzing
+
+Build the production broker and IPC parsers with libFuzzer, AddressSanitizer,
+and UndefinedBehaviorSanitizer:
+
+```sh
+make fuzz
+tests/fuzz/fuzz-broker tests/fuzz/corpus/broker -max_total_time=60
+tests/fuzz/fuzz-ipc tests/fuzz/corpus/ipc -max_total_time=60
+```
+
+The IPC harness exposes `parse_inplace` through a fuzz-build-only wrapper;
+normal binaries do not export that entry point. Seed corpora cover valid,
+malformed, length-framed, and payload-bearing messages.
 
 ## What is intentionally not tested
 
