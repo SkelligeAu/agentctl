@@ -34,10 +34,16 @@ int broker_make_token(char out[BROKER_TOKEN_LEN + 1])
     unsigned char r[4] = {0};
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
-    ssize_t n = read_all(fd, r, sizeof(r));
+    size_t off = 0;
+    while (off < sizeof(r)) {
+        ssize_t n = read(fd, r + off, sizeof(r) - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
     int saved = errno;
     close(fd);
-    if (n != (ssize_t)sizeof(r)) { errno = saved ? saved : EIO; return -1; }
+    if (off != sizeof(r)) { errno = saved ? saved : EIO; return -1; }
     for (int i = 0; i < 4; i++) {
         out[i * 2]     = hex[(r[i] >> 4) & 0xf];
         out[i * 2 + 1] = hex[r[i] & 0xf];
