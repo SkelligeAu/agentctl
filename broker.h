@@ -71,9 +71,4 @@ int broker_policy_check(const char *cap_name,
                         const char *const *allow_patterns,
                         int n_patterns);
 
-/* Issue mailbox.send:<target>: open a SOCK_SEQPACKET, connect to target's
- * <root>/agents/<target>/agent.sock, return the connected fd ready for SCM_RIGHTS.
- * Returns fd >= 0, -1 on local error, -2 if target has no listener. */
-int broker_open_mailbox_send(const char *target);
-
 #endif

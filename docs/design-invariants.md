@@ -121,23 +121,29 @@ not a production guarantee.
 
 Do not assume the above invariants extend beyond these limits:
 
-- Same-uid adversaries are out of scope. Two supervised processes
-  running as the same uid can `ptrace`, signal, and connect
-  directly to each other's listening sockets, bypassing the broker.
+- Same-uid adversaries are out of scope. Supervised agents have no pathname
+  listeners, but same-UID `ptrace`, `/proc` inspection, signals, and fd
+  forwarding can still cross the boundary.
 - `ptrace`, `SCM_RIGHTS` forwarding within an application, and
   `fork` without `O_CLOEXEC` discipline can move fds between
   processes that share a uid. The broker has no kernel-level
   mechanism to prevent this.
 - Once delivered, an fd cannot be reclaimed from a peer's fd table.
-  Revocation of a socket-anchored capability requires the broker to
-  close its end of the underlying socket (which propagates EOF on
-  next read/write) or the operator to restart the holding process.
+  agentd retains no copy after delivery, so revocation requires the operator
+  to restart the holding process.
   Filesystem-anchored capabilities, when added, will have weaker
   revocation: existing open fds keep working until the holder
   closes them.
-- `SO_PEERCRED` on a broker-issued connected fd reports `agentd` as
-  the connector (the broker is the process that called `connect`).
-  It does not report the requesting agent's pid.
+- The receiver obtains authenticated requester metadata from agentd beside
+  the delivered fd. `REPLY-TO` remains routing metadata, not identity.
+- A broker request and its fd-bearing response are one critical section.
+  Threads and forked descendants sharing fd 3 serialize the full exchange
+  through inherited fd 5; atomic request writes alone are insufficient.
+- Receiver capability delivery uses a datagram socketpair so consecutive
+  `SCM_RIGHTS` deliveries retain boundaries on Linux and macOS.
+- Restart backoff is exponential from 1 second and capped at 30 seconds.
+  Five runs shorter than 30 seconds enter `crash-loop`, set desired state to
+  `stopped`, and require an explicit operator start.
 
 ### Conventions
 
@@ -189,9 +195,11 @@ Do not assume the above invariants extend beyond these limits:
   observe `EWOULDBLOCK` and refuse to start. The kernel releases
   the lock on any exit (including SIGKILL/OOM); successors can
   acquire it immediately after a crash.
-- The agent directory `agentctl_root()/agents/<name>/` is the
-  canonical operator interface for per-agent state. Files are owned
-  by the running user and 0600 by default.
+- The agent directory `agentctl_root()/agents/<name>/` is split by owner:
+  `config/` contains operator/supervisor inputs, `runtime/` contains status
+  metadata, and `data/` is the child runtime's working and writable directory.
+  Compatibility symlinks expose legacy top-level names to operator tools, but
+  confined children are not granted access to the parent directory.
 - Runtime authority and liveness live in `agentd`'s memory and the
   pidfds it holds. Files under `agents/<name>/` are a persisted
   projection of supervisor state, not the source of truth for any
@@ -202,17 +210,17 @@ Do not assume the above invariants extend beyond these limits:
 These files are read by the runtime during normal operation. Edits
 take effect on the next runtime read:
 
-- `policy` — broker reads on every issuance request.
-- `desired_state`, `enabled` — agentd reads on inotify events and
+- `config/policy` — broker reads on every issuance request.
+- `config/desired_state`, `config/enabled` — agentd reads on inotify events and
   during the periodic reconcile scan.
-- `exec` — agentd reads when reconciling a `desired_state=running`
+- `config/exec` — agentd reads when reconciling a `desired_state=running`
   entry that is not currently spawned.
 
 ### Display artifacts
 
-- `pid` — last pid as written by the supervisor; used by `psa` and
+- `runtime/pid` — last pid as written by the supervisor; used by `psa` and
   `agentctl inspect`. Not authoritative.
-- `status` — symbolic state word as last written by the runtime; used
+- `runtime/status` — symbolic state word as last written by the runtime; used
   by display tools. Not authoritative.
 
 ### Notes

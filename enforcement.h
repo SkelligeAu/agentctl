@@ -50,6 +50,7 @@ int enforcement_parent_attach_pid(const enforcement_state_t *state, pid_t pid);
 /* Child: apply landlock + seccomp, writes the full enforcement.applied file
  * (merging in cgroup state passed in `state`). cwd is the agent dir. */
 int enforcement_child_apply(const char *agent_name,
+                             const char *runtime_path,
                              const enforcement_spec_t *spec,
                              enforcement_state_t *state);
 

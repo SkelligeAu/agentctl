@@ -10,6 +10,8 @@
  * authority; the message flows agent-to-agent directly.
  */
 
+#include "common.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -85,6 +87,7 @@ int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "broker-test: missing <name>\n"); return 2; }
     const char *self = argv[1];
+    write_status(self, "idle");
     /* Target is read from `broker-target` in the cwd (agentd chdirs to
      * /tmp/agents/<name>/ before exec). Falls back to BROKER_TARGET env. */
     char target_buf[64] = {0};
@@ -116,13 +119,16 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "broker-test: got cap fd=%d token=%s\n", issued_fd, token);
 
-    /* Build a small framed message and send it directly on the issued fd. */
-    char msg[256];
-    int mn = snprintf(msg, sizeof(msg),
-                      "VERB hello\nREPLY-TO %s\nTASK-ID broker-f4\n\nhi from %s\n",
-                      self, self);
-    if (mn <= 0) { close(issued_fd); return 1; }
-    if (send(issued_fd, msg, (size_t)mn, 0) < 0) {
+    /* Use the canonical framing helper: Linux uses one SEQPACKET record;
+     * Darwin's development transport adds the required LEN header. */
+    char payload[128];
+    int pn = snprintf(payload, sizeof(payload), "hi from %s\n", self);
+    if (pn <= 0 || (size_t)pn >= sizeof(payload)) {
+        close(issued_fd);
+        return 1;
+    }
+    if (send_framed_message_ex(issued_fd, "hello", self, "broker-f4",
+                               payload, (size_t)pn) < 0) {
         perror("send on issued fd");
         close(issued_fd);
         return 1;

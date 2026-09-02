@@ -30,7 +30,7 @@ run_one ipc_msg_ctrunc      "$HERE"/test_ipc_msg_ctrunc
 run_one cloexec_propagation "$HERE"/test_cloexec
 
 echo "== broker integration tests =="
-for s in broker_default_deny broker_wildcard broker_malformed \
+for s in broker_default_deny broker_wildcard broker_concurrency broker_malformed \
          broker_msg_ctrunc policy_not_authority broker_no_state; do
     run_one "$s" sh "$HERE/$s.sh"
 done
@@ -41,6 +41,12 @@ echo "== per-uid isolation tests =="
 for s in agentctl_foreign_root agentd_single_instance agentd_lockfile_kill9; do
     run_one "$s" sh "$HERE/$s.sh"
 done
+
+echo "== authority boundary tests =="
+run_one phase1_authority_boundary sh "$HERE/phase1_authority_boundary.sh"
+
+echo "== lifecycle hardening tests =="
+run_one restart_crash_loop sh "$HERE/restart_crash_loop.sh"
 
 echo
 echo "results: pass=$pass fail=$fail skip=$skip"

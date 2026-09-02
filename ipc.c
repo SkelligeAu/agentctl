@@ -27,6 +27,44 @@
 #  include <sys/ucred.h>
 #endif
 
+/* fd 3 is shared by every thread and forked descendant of a supervised
+ * runtime. A process-local guard serializes threads; the inherited regular
+ * fd 5 supplies a POSIX record lock that serializes distinct processes. */
+static volatile int g_broker_thread_lock = 0;
+
+static int broker_exchange_lock(void)
+{
+    const char *marker = getenv("AGENTCTL_BROKER_LOCK_FD");
+    if (!marker || strcmp(marker, "5") != 0 ||
+        fcntl(BROKER_LOCK_FD_SLOT, F_GETFD) < 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    while (__sync_lock_test_and_set(&g_broker_thread_lock, 1)) {
+        struct timespec ts = { 0, 1000L * 1000L };
+        nanosleep(&ts, NULL);
+    }
+    struct flock lk;
+    memset(&lk, 0, sizeof(lk));
+    lk.l_type = F_WRLCK;
+    lk.l_whence = SEEK_SET;
+    int rc;
+    do { rc = fcntl(BROKER_LOCK_FD_SLOT, F_SETLKW, &lk); }
+    while (rc < 0 && errno == EINTR);
+    if (rc < 0) __sync_lock_release(&g_broker_thread_lock);
+    return rc;
+}
+
+static void broker_exchange_unlock(void)
+{
+    struct flock lk;
+    memset(&lk, 0, sizeof(lk));
+    lk.l_type = F_UNLCK;
+    lk.l_whence = SEEK_SET;
+    (void)fcntl(BROKER_LOCK_FD_SLOT, F_SETLK, &lk);
+    __sync_lock_release(&g_broker_thread_lock);
+}
+
 /* Per-platform socket type. */
 #if defined(__linux__)
 #  define IPC_SOCK_TYPE SOCK_SEQPACKET
@@ -67,9 +105,7 @@ static int set_nonblock(int fd)
 
 static int sock_path_for(const char *agent_name, char *out, size_t n)
 {
-    int r = snprintf(out, n, "%s/%s/agent.sock", AGENT_ROOT, agent_name);
-    if (r < 0 || (size_t)r >= n) { errno = ENAMETOOLONG; return -1; }
-    return 0;
+    return agent_path(out, n, agent_name, "agent.sock");
 }
 
 /* ----------------------------------------------------------------
@@ -78,6 +114,11 @@ static int sock_path_for(const char *agent_name, char *out, size_t n)
 
 int ipc_listen(const char *agent_name)
 {
+    /* agentd-supervised runtimes receive a private capability-delivery
+     * channel at fd 4. No pathname mailbox is created in that mode. */
+    const char *inherited = getenv("AGENTCTL_INBOX_FD");
+    if (inherited && strcmp(inherited, "4") == 0 &&
+        fcntl(INBOX_FD_SLOT, F_GETFD) != -1) return INBOX_FD_SLOT;
     char path[MAX_PATHBUF];
     if (sock_path_for(agent_name, path, sizeof(path)) != 0) return -1;
     (void)unlink(path);
@@ -138,6 +179,49 @@ static int read_peer_creds(int fd, peer_id_t *out)
 
 int ipc_accept(int server_fd, peer_id_t *out_peer)
 {
+    if (server_fd == INBOX_FD_SLOT) {
+        char meta[256];
+        char control[CMSG_SPACE(sizeof(int))];
+        struct iovec iov = { .iov_base = meta, .iov_len = sizeof(meta) - 1 };
+        struct msghdr mh;
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_iov = &iov; mh.msg_iovlen = 1;
+        mh.msg_control = control; mh.msg_controllen = sizeof(control);
+        ssize_t n;
+        do { n = recvmsg(server_fd, &mh, MSG_CMSG_CLOEXEC); } while (n < 0 && errno == EINTR);
+        if (n <= 0 || (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+            /* EOF on the inherited delivery channel means agentd is gone.
+             * Convert it to the normal runtime shutdown signal so callers do
+             * not spin forever polling a permanently readable EOF. */
+            if (n == 0) {
+                shutdown_flag = 1;
+                errno = EINTR;
+            }
+            else if (n > 0) errno = EPROTO;
+            return -1;
+        }
+        int issued = -1;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                memcpy(&issued, CMSG_DATA(c), sizeof(issued)); break;
+            }
+        if (issued < 0) { errno = EPROTO; return -1; }
+        set_cloexec(issued);
+        meta[n] = '\0';
+        if (out_peer) {
+            memset(out_peer, 0, sizeof(*out_peer));
+            char sender[MAX_NAME] = "";
+            long pid = 0, uid = 0;
+            (void)sscanf(meta, "SENDER %63s\nPID %ld\nUID %ld", sender, &pid, &uid);
+            snprintf(out_peer->authenticated_name,
+                     sizeof(out_peer->authenticated_name), "%s", sender);
+            out_peer->pid = (pid_t)pid;
+            out_peer->uid = (uid_t)uid;
+        }
+        struct timeval tv = { 30, 0 };
+        (void)setsockopt(issued, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        return issued;
+    }
     int cfd;
     do {
         cfd = accept(server_fd, NULL, NULL);
@@ -153,6 +237,45 @@ int ipc_accept(int server_fd, peer_id_t *out_peer)
 
 int ipc_connect(const char *target)
 {
+    /* Supervised runtimes never know a mailbox pathname. Acquire a fresh
+     * connected capability through their inherited broker channel. */
+    int broker_type = 0; socklen_t broker_type_len = sizeof(broker_type);
+    if (fcntl(BROKER_FD_SLOT, F_GETFD) != -1 &&
+        getsockopt(BROKER_FD_SLOT, SOL_SOCKET, SO_TYPE,
+                   &broker_type, &broker_type_len) == 0) {
+        if (validate_name(target) != 0) { errno = EINVAL; return IPC_ERR; }
+        if (broker_exchange_lock() != 0) return IPC_ERR;
+        char req[256];
+        int rn = snprintf(req, sizeof(req),
+                          "VERB request\nCAP mailbox.send:%s\nREASON libagentctl\n\n",
+                          target);
+        if (rn <= 0 || send(BROKER_FD_SLOT, req, (size_t)rn, 0) < 0) {
+            broker_exchange_unlock();
+            return IPC_ERR;
+        }
+        char resp[512], control[CMSG_SPACE(sizeof(int))];
+        struct iovec iov = { .iov_base = resp, .iov_len = sizeof(resp) };
+        struct msghdr mh;
+        memset(&mh, 0, sizeof(mh)); mh.msg_iov = &iov; mh.msg_iovlen = 1;
+        mh.msg_control = control; mh.msg_controllen = sizeof(control);
+        ssize_t got;
+        do { got = recvmsg(BROKER_FD_SLOT, &mh, MSG_CMSG_CLOEXEC); }
+        while (got < 0 && errno == EINTR);
+        if (got <= 0) { broker_exchange_unlock(); return IPC_ERR; }
+        int issued = -1;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                memcpy(&issued, CMSG_DATA(c), sizeof(issued)); break;
+            }
+        if (issued < 0) {
+            broker_exchange_unlock();
+            errno = EACCES;
+            return IPC_ERR;
+        }
+        set_cloexec(issued);
+        broker_exchange_unlock();
+        return issued;
+    }
     char path[MAX_PATHBUF];
     if (sock_path_for(target, path, sizeof(path)) != 0) return IPC_ERR;
     int fd = socket(AF_UNIX, IPC_SOCK_TYPE | SOCK_CLOEXEC, 0);
@@ -176,7 +299,7 @@ int ipc_connect(const char *target)
 void ipc_close_listener(int server_fd, const char *agent_name)
 {
     if (server_fd >= 0) close(server_fd);
-    if (agent_name) {
+    if (agent_name && server_fd != INBOX_FD_SLOT) {
         char path[MAX_PATHBUF];
         if (sock_path_for(agent_name, path, sizeof(path)) == 0)
             (void)unlink(path);

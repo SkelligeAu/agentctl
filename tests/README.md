@@ -33,10 +33,11 @@ All three are Linux-only and `_exit(77)` on non-Linux platforms.
 | File | Asserts |
 |---|---|
 | `broker_default_deny.sh` | Empty `policy` → broker emits `denied: not-in-caps` and no fd is delivered |
-| `broker_wildcard.sh` | `allow mailbox.send:*` permits a `mailbox.send:<peer>` issuance |
+| `broker_wildcard.sh` | Wildcard issuance works, the target exposes no pathname mailbox, and the receiver observes broker-authenticated sender identity |
 | `broker_malformed.sh` | Malformed broker request → `denied: malformed-request` AND the broker channel remains usable for a second request |
 | `broker_msg_ctrunc.sh` | A request carrying more SCM_RIGHTS fds than agentd's cmsg buffer holds → agentd closes the channel and logs the protocol violation |
 | `policy_not_authority.sh` | A granted policy line does NOT pre-materialize as an open fd in the holder's fd table; only broker issuance does |
+| `phase1_authority_boundary.sh` | A Landlock-confined child cannot modify `config/policy`, and an unauthenticated control-socket command is rejected |
 | `broker_no_state.sh` | After 5 broker issuances + 5 process exits, agentd's `/proc/<pid>/fd/` count returns to its starting value (broker holds no per-issuance state) |
 
 The broker drivers use `broker-fault` for fault injection. Modes

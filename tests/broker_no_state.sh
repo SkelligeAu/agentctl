@@ -3,6 +3,11 @@
 
 set -e
 . "$(dirname "$0")/_lib.sh"
+
+if [ "$(uname -s)" != Linux ]; then
+    echo "skip: linux-only (/proc fd inspection)"
+    exit 77
+fi
 TGT=tns-tgt
 
 cleanup() {
@@ -28,7 +33,7 @@ for i in 1 2 3 4 5; do
     R="tns-req-$i"
     agentctl create "$R" --profile worker > /dev/null
     agentctl grant  "$R" "mailbox.send:$TGT"   > /dev/null
-    echo "$TGT" > "$AAGENTS/$R/broker-target"
+    echo "$TGT" > "$AAGENTS/$R/data/broker-target"
     agentctl start  "$R" --exec "$(command -v broker-test)" > /dev/null
 done
 sleep 1.0

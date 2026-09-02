@@ -192,6 +192,16 @@ const char *agentd_log_path(void)
     return path;
 }
 
+const char *agentd_token_path(void)
+{
+    static char path[MAX_PATHBUF];
+    static int initialized = 0;
+    if (initialized) return path;
+    snprintf(path, sizeof(path), "%s/agentd.token", agentctl_root());
+    initialized = 1;
+    return path;
+}
+
 int agent_dir(char *out, size_t n, const char *name)
 {
     if (validate_name(name) != 0) { errno = EINVAL; return -1; }
@@ -200,11 +210,112 @@ int agent_dir(char *out, size_t n, const char *name)
     return 0;
 }
 
+static int agent_subdir(char *out, size_t n, const char *name, const char *subdir)
+{
+    if (validate_name(name) != 0) { errno = EINVAL; return -1; }
+    int r = snprintf(out, n, "%s/%s/%s", AGENT_ROOT, name, subdir);
+    if (r < 0 || (size_t)r >= n) { errno = ENAMETOOLONG; return -1; }
+    return 0;
+}
+
+int agent_config_dir(char *out, size_t n, const char *name)
+{
+    return agent_subdir(out, n, name, "config");
+}
+
+int agent_runtime_dir(char *out, size_t n, const char *name)
+{
+    return agent_subdir(out, n, name, "runtime");
+}
+
+int agent_data_dir(char *out, size_t n, const char *name)
+{
+    return agent_subdir(out, n, name, "data");
+}
+
+static const char *leaf_class(const char *leaf)
+{
+    static const char *const config_leaves[] = {
+        "goal", "policy", "limits", "profile", "config", "exec", "runtime",
+        "desired_state", "enabled", "restart_policy", "transport", NULL
+    };
+    static const char *const runtime_leaves[] = {
+        "pid", "status", "supervisor", "restart_count",
+        "enforcement.req", "enforcement.applied", NULL
+    };
+    if (!leaf) return "data";
+    for (int i = 0; config_leaves[i]; i++)
+        if (strcmp(leaf, config_leaves[i]) == 0) return "config";
+    for (int i = 0; runtime_leaves[i]; i++)
+        if (strcmp(leaf, runtime_leaves[i]) == 0) return "runtime";
+    return "data";
+}
+
+static void ensure_legacy_link(const char *base, const char *leaf, const char *klass)
+{
+    if (!leaf || strchr(leaf, '/')) return;
+    char oldp[MAX_PATHBUF], target[MAX_PATHBUF];
+    int a = snprintf(oldp, sizeof(oldp), "%s/%s", base, leaf);
+    int b = snprintf(target, sizeof(target), "%s/%s", klass, leaf);
+    if (a < 0 || b < 0 || (size_t)a >= sizeof(oldp) || (size_t)b >= sizeof(target))
+        return;
+    struct stat st;
+    if (lstat(oldp, &st) != 0 && errno == ENOENT) (void)symlink(target, oldp);
+}
+
+int agent_ensure_layout(const char *name)
+{
+    char base[MAX_PATHBUF], config[MAX_PATHBUF], runtime[MAX_PATHBUF], data[MAX_PATHBUF];
+    if (agent_dir(base, sizeof(base), name) != 0 ||
+        agent_config_dir(config, sizeof(config), name) != 0 ||
+        agent_runtime_dir(runtime, sizeof(runtime), name) != 0 ||
+        agent_data_dir(data, sizeof(data), name) != 0) return -1;
+    struct stat st;
+    if (stat(base, &st) != 0) return -1;
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+    if (ensure_dir(config, 0700) != 0 || ensure_dir(runtime, 0700) != 0 ||
+        ensure_dir(data, 0700) != 0) return -1;
+
+    DIR *d = opendir(base);
+    if (!d) return -1;
+    struct dirent *e;
+    int rc = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.' || strcmp(e->d_name, "config") == 0 ||
+            strcmp(e->d_name, "runtime") == 0 || strcmp(e->d_name, "data") == 0)
+            continue;
+        char oldp[MAX_PATHBUF], newp[MAX_PATHBUF];
+        const char *klass = leaf_class(e->d_name);
+        int a = snprintf(oldp, sizeof(oldp), "%s/%s", base, e->d_name);
+        int b = snprintf(newp, sizeof(newp), "%s/%s/%s", base, klass, e->d_name);
+        if (a < 0 || b < 0 || (size_t)a >= sizeof(oldp) || (size_t)b >= sizeof(newp)) {
+            rc = -1; errno = ENAMETOOLONG; break;
+        }
+        if (lstat(newp, &st) != 0) {
+            if (errno != ENOENT || rename(oldp, newp) != 0) { rc = -1; break; }
+        }
+        ensure_legacy_link(base, e->d_name, klass);
+    }
+    int saved = errno;
+    closedir(d);
+    errno = saved;
+    return rc;
+}
+
 int agent_path(char *out, size_t n, const char *name, const char *leaf)
 {
     if (validate_name(name) != 0) { errno = EINVAL; return -1; }
-    int r = snprintf(out, n, "%s/%s/%s", AGENT_ROOT, name, leaf);
+    char base[MAX_PATHBUF];
+    if (agent_dir(base, sizeof(base), name) != 0) return -1;
+    char config_dir[MAX_PATHBUF];
+    struct stat st;
+    if (agent_config_dir(config_dir, sizeof(config_dir), name) != 0) return -1;
+    if (stat(config_dir, &st) != 0 && errno == ENOENT &&
+        agent_ensure_layout(name) != 0) return -1;
+    const char *klass = leaf_class(leaf);
+    int r = snprintf(out, n, "%s/%s/%s", base, klass, leaf);
     if (r < 0 || (size_t)r >= n) { errno = ENAMETOOLONG; return -1; }
+    ensure_legacy_link(base, leaf, klass);
     return 0;
 }
 
@@ -1011,12 +1122,17 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
                         const char *supervisor_label,
                         int fs_override, int sc_override, int cg_override,
                         pid_t *out_pid,
-                        int *out_broker_fd)
+                        int *out_broker_fd,
+                        int *out_inbox_fd)
 {
     if (out_broker_fd) *out_broker_fd = -1;
+    if (out_inbox_fd) *out_inbox_fd = -1;
     if (validate_name(name) != 0) { errno = EINVAL; return -1; }
-    char dir[MAX_PATHBUF];
-    if (agent_dir(dir, sizeof(dir), name) != 0) return -1;
+    char dir[MAX_PATHBUF], data_dir[MAX_PATHBUF], runtime_dir[MAX_PATHBUF];
+    if (agent_dir(dir, sizeof(dir), name) != 0 ||
+        agent_ensure_layout(name) != 0 ||
+        agent_data_dir(data_dir, sizeof(data_dir), name) != 0 ||
+        agent_runtime_dir(runtime_dir, sizeof(runtime_dir), name) != 0) return -1;
     struct stat st;
     if (stat(dir, &st) != 0) return -1;
 
@@ -1068,6 +1184,7 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
      * sv[0] is the agentd-side end (kept by parent); sv[1] becomes fd 3 in
      * the child via dup2 (with O_CLOEXEC cleared so it survives exec). */
     int broker_sv[2] = { -1, -1 };
+    int broker_lock_fd = -1;
     if (out_broker_fd) {
         int stype =
 #if defined(__linux__)
@@ -1092,6 +1209,38 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
             errno = saved;
             return -1;
         }
+        char lock_path[MAX_PATHBUF];
+        if (snprintf(lock_path, sizeof(lock_path), "%s/broker.lock", runtime_dir)
+                >= (int)sizeof(lock_path) ||
+            (broker_lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600)) < 0) {
+            int saved = errno;
+            close(broker_sv[0]); close(broker_sv[1]);
+            if (audit_fd != -1) close(audit_fd);
+            errno = saved;
+            return -1;
+        }
+        /* The descriptor, not this pathname, is the synchronization
+         * authority. Removing the name also prevents runtime code from
+         * opening an independent lock description. */
+        (void)unlink(lock_path);
+    }
+
+    int inbox_sv[2] = { -1, -1 };
+    if (out_inbox_fd) {
+        /* Inbox delivery carries one fd plus fixed metadata per datagram.
+         * Datagram boundaries are required even on Darwin: SOCK_STREAM can
+         * coalesce consecutive SCM_RIGHTS deliveries into one recvmsg. */
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, inbox_sv) != 0) {
+            int saved = errno;
+            if (broker_sv[0] >= 0) { close(broker_sv[0]); close(broker_sv[1]); }
+            if (broker_lock_fd >= 0) close(broker_lock_fd);
+            if (audit_fd != -1) close(audit_fd);
+            errno = saved; return -1;
+        }
+        for (int i = 0; i < 2; i++) {
+            int fl = fcntl(inbox_sv[i], F_GETFD);
+            if (fl != -1) (void)fcntl(inbox_sv[i], F_SETFD, fl | FD_CLOEXEC);
+        }
     }
 
     pid_t pid = fork();
@@ -1099,13 +1248,15 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
         int saved = errno;
         if (audit_fd != -1) close(audit_fd);
         if (broker_sv[0] >= 0) { close(broker_sv[0]); close(broker_sv[1]); }
+        if (inbox_sv[0] >= 0) { close(inbox_sv[0]); close(inbox_sv[1]); }
+        if (broker_lock_fd >= 0) close(broker_lock_fd);
         errno = saved;
         return -1;
     }
     if (pid == 0) {
         /* child */
         if (setsid() == -1) _exit(127);
-        if (chdir(dir) == -1) _exit(127);
+        if (chdir(data_dir) == -1) _exit(127);
         int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (devnull != -1) { dup2(devnull, 0); close(devnull); }
         if (audit_fd != -1) { dup2(audit_fd, 1); dup2(audit_fd, 2); close(audit_fd); }
@@ -1118,14 +1269,39 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
             if (fl != -1) fcntl(3, F_SETFD, fl & ~FD_CLOEXEC);
             if (broker_sv[1] != 3) close(broker_sv[1]);
         }
-        apply_limits_from_file("limits");
-        (void)enforcement_child_apply(name, &spec, &enf);
+        if (inbox_sv[1] >= 0) {
+            close(inbox_sv[0]);
+            if (dup2(inbox_sv[1], INBOX_FD_SLOT) != INBOX_FD_SLOT) _exit(127);
+            int fl = fcntl(INBOX_FD_SLOT, F_GETFD);
+            if (fl != -1) fcntl(INBOX_FD_SLOT, F_SETFD, fl & ~FD_CLOEXEC);
+            if (inbox_sv[1] != INBOX_FD_SLOT) close(inbox_sv[1]);
+            (void)setenv("AGENTCTL_INBOX_FD", "4", 1);
+        }
+        if (broker_lock_fd >= 0) {
+            if (dup2(broker_lock_fd, BROKER_LOCK_FD_SLOT) != BROKER_LOCK_FD_SLOT)
+                _exit(127);
+            int fl = fcntl(BROKER_LOCK_FD_SLOT, F_GETFD);
+            if (fl != -1)
+                fcntl(BROKER_LOCK_FD_SLOT, F_SETFD, fl & ~FD_CLOEXEC);
+            if (broker_lock_fd != BROKER_LOCK_FD_SLOT) close(broker_lock_fd);
+            (void)setenv("AGENTCTL_BROKER_LOCK_FD", "5", 1);
+        }
+        char limits_path[MAX_PATHBUF];
+        if (agent_path(limits_path, sizeof(limits_path), name, "limits") == 0)
+            apply_limits_from_file(limits_path);
+        (void)enforcement_child_apply(name, runtime_abs, &spec, &enf);
         char argv0[MAX_NAME + 16];
         int an = snprintf(argv0, sizeof(argv0), "agent:%s", name);
         if (an < 0 || (size_t)an >= sizeof(argv0)) _exit(127);
         execl(runtime_abs, argv0, name, (char *)NULL);
-        const char *m = "spawn_agent_runtime: execl failed\n";
-        (void)!write(2, m, strlen(m));
+        char exec_error[256];
+        int exec_error_len = snprintf(
+            exec_error, sizeof(exec_error),
+            "spawn_agent_runtime: execl %s failed: %s\n",
+            runtime_abs, strerror(errno)
+        );
+        if (exec_error_len > 0)
+            (void)!write(2, exec_error, (size_t)exec_error_len);
         _exit(127);
     }
     /* parent */
@@ -1134,6 +1310,11 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
         close(broker_sv[1]);          /* child's end stays in the child */
         *out_broker_fd = broker_sv[0];
     }
+    if (inbox_sv[0] >= 0) {
+        close(inbox_sv[1]);
+        *out_inbox_fd = inbox_sv[0];
+    }
+    if (broker_lock_fd >= 0) close(broker_lock_fd);
 
     char pidbuf[32];
     int rl = snprintf(pidbuf, sizeof(pidbuf), "%ld\n", (long)pid);

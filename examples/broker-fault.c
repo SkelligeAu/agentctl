@@ -106,14 +106,22 @@ static int run_many_fds(void)
     /* Open 8 spurious fds. agentd's cmsg buffer holds 4; the kernel will
      * deliver 4 and set MSG_CTRUNC on the remainder. agentd's contract is
      * to treat MSG_CTRUNC as fatal: close the channel. */
+    int source_fd = open("broker-fault-mode", O_RDONLY | O_CLOEXEC);
+    if (source_fd < 0) {
+        fprintf(stderr, "broker-fault many-fds: open source: %s\n",
+                strerror(errno));
+        return 1;
+    }
     int fds[8];
     for (int i = 0; i < 8; i++) {
-        fds[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        fds[i] = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
         if (fds[i] < 0) {
-            fprintf(stderr, "broker-fault many-fds: open: %s\n", strerror(errno));
+            fprintf(stderr, "broker-fault many-fds: dup: %s\n", strerror(errno));
+            close(source_fd);
             return 1;
         }
     }
+    close(source_fd);
     /* Build a header that broker_parse would accept (the cmsg overflow
      * triggers before parse runs). */
     const char *hdr = "VERB request\nCAP mailbox.send:peer\n\n";

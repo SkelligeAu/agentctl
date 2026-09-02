@@ -3,8 +3,8 @@ CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -O2 \
            -D_POSIX_C_SOURCE=200809L -D_DARWIN_C_SOURCE -D_GNU_SOURCE
 LDFLAGS ?=
 
-BINS = agentctl agentd reviewer-agent fanout-agent psa broker-test broker-fault
-TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec
+BINS = agentctl agentd reviewer-agent fanout-agent psa broker-test broker-fault broker-concurrency
+TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec tests/phase1-probe tests/crash-agent
 LIBOBJS = common.o ipc.o broker.o profiles.o tasks.o enforcement.o
 LIB = libagentctl.a
 
@@ -32,11 +32,14 @@ fanout-agent: fanout-agent.o $(LIBOBJS)
 psa: psa.o $(LIBOBJS)
 	$(CC) $(LDFLAGS) -o $@ psa.o $(LIBOBJS)
 
-broker-test: examples/broker-test.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ examples/broker-test.c
+broker-test: examples/broker-test.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ examples/broker-test.c $(LIBOBJS)
 
 broker-fault: examples/broker-fault.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ examples/broker-fault.c
+
+broker-concurrency: examples/broker-concurrency.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ examples/broker-concurrency.c $(LIBOBJS)
 
 tests/test_ipc_msg_trunc: tests/test_ipc_msg_trunc.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_ipc_msg_trunc.c $(LIBOBJS)
@@ -46,6 +49,12 @@ tests/test_ipc_msg_ctrunc: tests/test_ipc_msg_ctrunc.c $(LIBOBJS)
 
 tests/test_cloexec: tests/test_cloexec.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_cloexec.c $(LIBOBJS)
+
+tests/phase1-probe: tests/phase1-probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/phase1-probe.c
+
+tests/crash-agent: tests/crash-agent.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/crash-agent.c $(LIBOBJS)
 
 agentctl.o: agentctl.c common.h profiles.h tasks.h enforcement.h
 	$(CC) $(CFLAGS) -c -o $@ agentctl.c

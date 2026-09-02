@@ -153,39 +153,3 @@ int broker_policy_check(const char *cap_name,
     }
     return 0;
 }
-
-/* ---------- mailbox.send opener ---------- */
-
-int broker_open_mailbox_send(const char *target)
-{
-    if (!target || !*target) { errno = EINVAL; return -1; }
-    if (validate_name(target) != 0) { errno = EINVAL; return -1; }
-
-    char path[MAX_PATHBUF];
-    int n = snprintf(path, sizeof(path),
-                     "%s/%s/agent.sock", AGENT_ROOT, target);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        errno = ENAMETOOLONG; return -1;
-    }
-
-    int sock_type =
-#if defined(__linux__)
-        SOCK_SEQPACKET;
-#else
-        SOCK_STREAM;   /* macOS fallback; broker is Linux-only in practice */
-#endif
-
-    int fd = socket(AF_UNIX, sock_type | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-
-    struct sockaddr_un a;
-    memset(&a, 0, sizeof(a));
-    a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
-        int saved = errno; close(fd);
-        if (saved == ENOENT || saved == ECONNREFUSED) { errno = saved; return -2; }
-        errno = saved; return -1;
-    }
-    return fd;
-}

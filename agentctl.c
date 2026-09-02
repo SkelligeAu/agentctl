@@ -24,6 +24,9 @@
 #if defined(__APPLE__)
 #  include <libproc.h>
 #endif
+#if !defined(MSG_CMSG_CLOEXEC)
+#  define MSG_CMSG_CLOEXEC 0
+#endif
 
 /* ---------- create ---------- */
 
@@ -45,6 +48,10 @@ static int cmd_create(const char *name, const char *profile)
     if (agent_dir(dir, sizeof(dir), name) != 0) return 1;
     if (mkdir(dir, 0700) != 0) {
         fprintf(stderr, "create: cannot create %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    if (agent_ensure_layout(name) != 0) {
+        fprintf(stderr, "create: cannot initialize agent layout: %s\n", strerror(errno));
         return 1;
     }
     static const char *subdirs[] = { "artifacts", "outbox", NULL };
@@ -275,8 +282,15 @@ static int agentd_request(const char *cmd_line, char *out_resp, size_t n)
     struct timeval tv = { 5, 0 };
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    char buf[512];
-    int w = snprintf(buf, sizeof(buf), "%s\n", cmd_line);
+    char token[129];
+    if (read_small_file(agentd_token_path(), token, sizeof(token), NULL) != 0) {
+        close(fd);
+        errno = EACCES;
+        return -1;
+    }
+    token[strcspn(token, "\r\n")] = '\0';
+    char buf[768];
+    int w = snprintf(buf, sizeof(buf), "AUTH %s %s\n", token, cmd_line);
     if (w < 0 || (size_t)w >= sizeof(buf)) { close(fd); errno = EOVERFLOW; return -1; }
     if (write_all(fd, buf, (size_t)w) == -1) { close(fd); return -1; }
     (void)shutdown(fd, SHUT_WR);
@@ -288,6 +302,41 @@ static int agentd_request(const char *cmd_line, char *out_resp, size_t n)
     while (r > 0 && (out_resp[r-1] == '\n' || out_resp[r-1] == '\r'))
         out_resp[--r] = '\0';
     return 0;
+}
+
+static int agentd_issue_mailbox(const char *target)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd == -1) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a)); a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", agentd_sock_path());
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
+    char token[129];
+    if (read_small_file(agentd_token_path(), token, sizeof(token), NULL) != 0) {
+        close(fd); return -1;
+    }
+    token[strcspn(token, "\r\n")] = '\0';
+    char req[512];
+    int rl = snprintf(req, sizeof(req), "AUTH %s issue %s\n", token, target);
+    if (rl < 0 || (size_t)rl >= sizeof(req) || write_all(fd, req, (size_t)rl) < 0) {
+        close(fd); return -1;
+    }
+    char response[256], control[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = { .iov_base = response, .iov_len = sizeof(response) - 1 };
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh)); mh.msg_iov = &iov; mh.msg_iovlen = 1;
+    mh.msg_control = control; mh.msg_controllen = sizeof(control);
+    ssize_t n = recvmsg(fd, &mh, MSG_CMSG_CLOEXEC);
+    close(fd);
+    if (n <= 0) return -1;
+    int issued = -1;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+            memcpy(&issued, CMSG_DATA(c), sizeof(issued)); break;
+        }
+    if (issued < 0) { errno = EACCES; return -1; }
+    return issued;
 }
 
 static int cmd_start(const char *name, const char *runtime_path,
@@ -337,13 +386,16 @@ static int cmd_start(const char *name, const char *runtime_path,
     }
 
     if (agentd_is_alive()) {
-        /* Files on disk are canonical. agentd will pick up the desired_state
-         * write either via inotify (Linux) or via its periodic scan (macOS).
-         * The `kick` over the socket is a best-effort nudge so we don't have
-         * to wait for the next poll-timer tick on platforms without inotify. */
-        char cmd_buf[256], resp[256];
-        snprintf(cmd_buf, sizeof(cmd_buf), "kick %s", name);
-        (void)agentd_request(cmd_buf, resp, sizeof(resp));
+        /* Use the synchronous daemon transition. This closes the race where
+         * a best-effort reconcile nudge returned before spawn bookkeeping
+         * and status publication had completed. */
+        char cmd_buf[256], resp[256] = {0};
+        snprintf(cmd_buf, sizeof(cmd_buf), "start %s", name);
+        if (agentd_request(cmd_buf, resp, sizeof(resp)) != 0 ||
+            strncmp(resp, "OK ", 3) != 0) {
+            fprintf(stderr, "start: agentd: %s\n", resp[0] ? resp : strerror(errno));
+            return 1;
+        }
 
         if (wait_for_status_flip(name, 3000) != 0) {
             fprintf(stderr,
@@ -361,7 +413,7 @@ static int cmd_start(const char *name, const char *runtime_path,
     pid_t pid = 0;
     if (spawn_agent_runtime(name, runtime_path, "direct",
                             fs_override, sc_override, cg_override,
-                            &pid, NULL) != 0) {
+                            &pid, NULL, NULL) != 0) {
         fprintf(stderr, "start: spawn: %s\n", strerror(errno));
         return 1;
     }
@@ -495,7 +547,18 @@ static int cmd_send(const char *name, const char *verb)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGPIPE, &sa, NULL);
 
-    int s = send_to_agent(name, verb, payload, total);
+    int s;
+    if (agentd_is_alive()) {
+        int capfd = agentd_issue_mailbox(name);
+        if (capfd < 0) s = -1;
+        else {
+            s = send_framed_message_ex(capfd, verb, "operator", NULL,
+                                       payload, total);
+            close(capfd);
+        }
+    } else {
+        s = send_to_agent(name, verb, payload, total);
+    }
     free(payload);
     if (s == -2) {
         fprintf(stderr, "send: no reader on inbox for '%s'\n", name);
@@ -915,12 +978,16 @@ static int cmd_stop(const char *name)
         int pidfd = -1;       /* lazy: only opened in the direct path */
         int via_pidfd = 0;
         if (agentd_is_alive()) {
-            /* Nudge agentd to reconcile right now (rather than waiting for
-             * its periodic scan on platforms without inotify). agentd holds
-             * the authoritative pidfd for its own children. */
-            char cmd_buf[256], resp[256];
-            snprintf(cmd_buf, sizeof(cmd_buf), "kick %s", name);
-            (void)agentd_request(cmd_buf, resp, sizeof(resp));
+            /* A synchronous stop makes agentd finish signaling and clear
+             * its runtime/broker state before we remove the directory. */
+            char cmd_buf[256], resp[256] = {0};
+            snprintf(cmd_buf, sizeof(cmd_buf), "stop %s", name);
+            if (agentd_request(cmd_buf, resp, sizeof(resp)) != 0 ||
+                strncmp(resp, "OK ", 3) != 0) {
+                fprintf(stderr, "stop: agentd: %s\n",
+                        resp[0] ? resp : strerror(errno));
+                return 1;
+            }
         } else {
             /* Direct mode (no supervisor). Lazily acquire a pidfd so signal
              * delivery is race-free against PID reuse after this point.
@@ -945,7 +1012,7 @@ static int cmd_stop(const char *name)
              * cgroup-active profiles. */
             (void)lifecycle_signal_group(pid, SIGTERM);
         }
-        if (wait_pid_gone(pid, pidfd, 2000) != 0) {
+        if (!agentd_is_alive() && wait_pid_gone(pid, pidfd, 2000) != 0) {
             fprintf(stderr,
                     "stop: pid %ld still running after 2s; try 'agentctl kill %s'\n",
                     (long)pid, name);
@@ -960,7 +1027,14 @@ static int cmd_stop(const char *name)
         printf("stopped %s (no live process)\n", name);
     }
 
-    if (remove_tree(dir) != 0) {
+    int cleanup_rc = remove_tree(dir);
+    for (int attempt = 0; cleanup_rc != 0 && errno == ENOTEMPTY && attempt < 2;
+         attempt++) {
+        struct timespec ts = { 0, 20L * 1000L * 1000L };
+        nanosleep(&ts, NULL);
+        cleanup_rc = remove_tree(dir);
+    }
+    if (cleanup_rc != 0) {
         fprintf(stderr, "stop: cleanup %s: %s\n", dir, strerror(errno));
         return 1;
     }

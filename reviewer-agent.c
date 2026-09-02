@@ -326,7 +326,10 @@ int main(int argc, char **argv)
                 audit_log(name, "accept error: %s", strerror(e));
                 continue;
             }
-            if (peer.pid > 0) {
+            if (peer.authenticated_name[0]) {
+                snprintf(sender_name, sizeof(sender_name), "%s",
+                         peer.authenticated_name);
+            } else if (peer.pid > 0) {
                 if (resolve_agent_by_pid(peer.pid, sender_name, sizeof(sender_name)) != 0)
                     snprintf(sender_name, sizeof(sender_name), "?");
             }

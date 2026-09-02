@@ -21,7 +21,7 @@ agentctl create "$NAME_REQ" --profile worker > /dev/null
 test ! -s "$AAGENTS/$NAME_REQ/policy" || {
     echo "FAIL: policy file is non-empty before grant"; exit 1; }
 
-echo "$NAME_TGT" > "$AAGENTS/$NAME_REQ/broker-target"
+echo "$NAME_TGT" > "$AAGENTS/$NAME_REQ/data/broker-target"
 agentctl start "$NAME_REQ" --exec "$(command -v broker-test)" > /dev/null
 sleep 0.5
 
