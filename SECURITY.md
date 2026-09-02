@@ -66,8 +66,8 @@ your threat model.
 |---|---|
 | Message payloads received over `SOCK_SEQPACKET` (or the macOS STREAM fallback) | Opaque bytes; the engine does not parse them. Application code parses; transport drops malformed frames + closes the connection. |
 | `MSG_TRUNC` / `MSG_CTRUNC` from a peer | Protocol violation; receiver closes the connection. Fatal at the connection level, never at the engine level. |
-| Filenames in artifact-write paths | Application must validate (no `/`, no `..`). The engine does not. |
-| Broker request bytes from a supervised process | Parsed by `broker_parse`; malformed requests denied with a logged audit line. |
+| Task ids and filenames in task/artifact paths | Centrally validated as single path components; traversal, hidden components, and oversized names are rejected. |
+| Broker request bytes from a supervised process | Parsed by `broker_parse`; missing required fields, duplicates, oversized fields, and malformed requests are denied with a logged audit line. |
 | The contents of `<root>/agents/<name>/config/policy` | **Privileged input.** The operator (via `agentctl grant`/`deny`) is the only authorized writer. Linux Landlock profiles grant the child read-only access to `config/`; writable application state is confined to `data/`. |
 
 ## What the kernel enforces

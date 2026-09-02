@@ -28,6 +28,7 @@ echo "== ipc unit tests =="
 run_one ipc_msg_trunc       "$HERE"/test_ipc_msg_trunc
 run_one ipc_msg_ctrunc      "$HERE"/test_ipc_msg_ctrunc
 run_one cloexec_propagation "$HERE"/test_cloexec
+run_one input_validation   "$HERE"/test_input_validation
 
 echo "== broker integration tests =="
 for s in broker_default_deny broker_wildcard broker_concurrency broker_malformed \

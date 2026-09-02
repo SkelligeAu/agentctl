@@ -278,7 +278,7 @@ static int collect_row(const char *name, struct agent_row *r)
     {
         char buf[32];
         if (read_agent_setting(name, "supervisor", buf, sizeof(buf)) == 0)
-            snprintf(r->sup, sizeof(r->sup), "%s", buf);
+            snprintf(r->sup, sizeof(r->sup), "%.7s", buf);
         else
             snprintf(r->sup, sizeof(r->sup), "-");
         r->restart_count = 0;

@@ -216,7 +216,7 @@ static int cgroup_setup_linux(const char *agent_name,
     }
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
         snprintf(st->reason, sizeof(st->reason),
-                 "mkdir %s: %s", dir, strerror(errno));
+                 "cgroup mkdir: %.220s", strerror(errno));
         st->cgroup_status = ENF_STATUS_UNAVAILABLE;
         return -1;
     }

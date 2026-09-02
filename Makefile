@@ -4,7 +4,8 @@ CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -O2 \
 LDFLAGS ?=
 
 BINS = agentctl agentd reviewer-agent fanout-agent psa broker-test broker-fault broker-concurrency
-TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec tests/phase1-probe tests/crash-agent
+TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec \
+	tests/test_input_validation tests/phase1-probe tests/crash-agent
 LIBOBJS = common.o ipc.o broker.o profiles.o tasks.o enforcement.o
 LIB = libagentctl.a
 FUZZ_CC ?= clang
@@ -66,6 +67,9 @@ tests/test_ipc_msg_ctrunc: tests/test_ipc_msg_ctrunc.c $(LIBOBJS)
 
 tests/test_cloexec: tests/test_cloexec.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_cloexec.c $(LIBOBJS)
+
+tests/test_input_validation: tests/test_input_validation.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_input_validation.c $(LIBOBJS)
 
 tests/phase1-probe: tests/phase1-probe.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/phase1-probe.c

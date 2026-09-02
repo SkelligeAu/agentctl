@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -233,8 +234,12 @@ static int agentd_is_alive(void)
     close(fd);
     if (r <= 0) return 0;
     buf[r] = '\0';
-    long p = strtol(buf, NULL, 10);
-    if (p <= 0) return 0;
+    char *end;
+    errno = 0;
+    long p = strtol(buf, &end, 10);
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (errno != 0 || end == buf || *end != '\0' || p <= 0 || p > INT_MAX)
+        return 0;
     return run_alive((pid_t)p);
 }
 
@@ -272,7 +277,12 @@ static int agentd_request(const char *cmd_line, char *out_resp, size_t n)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", agentd_sock_path());
+    const char *socket_path = agentd_sock_path();
+    size_t socket_path_len = strlen(socket_path);
+    if (socket_path_len >= sizeof(a.sun_path)) {
+        close(fd); errno = ENAMETOOLONG; return -1;
+    }
+    memcpy(a.sun_path, socket_path, socket_path_len + 1);
     if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
         int saved = errno;
         close(fd);
@@ -310,7 +320,12 @@ static int agentd_issue_mailbox(const char *target)
     if (fd == -1) return -1;
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a)); a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", agentd_sock_path());
+    const char *socket_path = agentd_sock_path();
+    size_t socket_path_len = strlen(socket_path);
+    if (socket_path_len >= sizeof(a.sun_path)) {
+        close(fd); errno = ENAMETOOLONG; return -1;
+    }
+    memcpy(a.sun_path, socket_path, socket_path_len + 1);
     if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
     char token[129];
     if (read_small_file(agentd_token_path(), token, sizeof(token), NULL) != 0) {
@@ -618,6 +633,9 @@ static int cmd_task(const char *name, const char *task_id)
     if (validate_name(name) != 0) {
         fprintf(stderr, "task: invalid agent name\n"); return 1;
     }
+    if (task_validate_id(task_id) != 0) {
+        fprintf(stderr, "task: invalid task id\n"); return 1;
+    }
     char buf[4096];
     char path[MAX_PATHBUF];
 
@@ -655,7 +673,8 @@ static int cmd_task(const char *name, const char *task_id)
                 while ((e = readdir(d)) != NULL) {
                     if (e->d_name[0] == '.') continue;
                     char fp[MAX_PATHBUF];
-                    snprintf(fp, sizeof(fp), "%s/%s", path, e->d_name);
+                    int written = snprintf(fp, sizeof(fp), "%s/%s", path, e->d_name);
+                    if (written < 0 || (size_t)written >= sizeof(fp)) continue;
                     struct stat st;
                     if (stat(fp, &st) != 0) continue;
                     if (!printed) { printf("artifacts:\n"); printed = 1; }

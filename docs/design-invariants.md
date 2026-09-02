@@ -52,6 +52,8 @@ not a production guarantee.
   before any caller can see the fd.
 - The header is ASCII; the payload is opaque bytes. The transport
   never inspects payload.
+- Duplicate known headers and malformed numeric length fields are protocol
+  violations. Parsers never silently truncate recognized field values.
 - No transport-layer userspace buffering. The kernel socket buffer
   is the only queue. There is no sender-side accumulator, no
   application ring buffer, no batching layer.
@@ -231,16 +233,15 @@ take effect on the next runtime read:
 
 ## Required tests
 
-Invariants that should be verified by executable tests. The QEMU
-integration test (`kernel/dev/share/agentfs-test.sh`) covers some;
-the rest are stubs under `tests/`. Coverage is honest: TODO means no
-test exists.
+The QEMU integration test (`kernel/dev/share/agentfs-test.sh`) and the
+userspace suite under `tests/` cover the invariants listed below.
 
 | Invariant | Covered? |
 |---|---|
 | `MSG_TRUNC` causes `ipc_recv` to return `IPC_PROTO_VIOLATION` | Covered: `tests/test_ipc_msg_trunc.c` (socketpair unit test) |
 | `MSG_CTRUNC` causes `ipc_recv` to return `IPC_PROTO_VIOLATION` | Covered: `tests/test_ipc_msg_ctrunc.c` (socketpair unit test) |
 | Received fds have `FD_CLOEXEC` set | Covered: `tests/test_cloexec.c` (socketpair unit test) |
+| Path components and broker fields fail closed instead of traversing or truncating | Covered: `tests/test_input_validation.c` |
 | Broker default-deny: empty policy → no issuance | Covered: `tests/broker_default_deny.sh` |
 | Wildcard policy grants matching caps | Covered: `tests/broker_wildcard.sh` |
 | Malformed broker request denied; channel remains open | Covered: `tests/broker_malformed.sh` (uses `broker-fault` in `malformed` mode) |

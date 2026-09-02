@@ -62,8 +62,9 @@ int broker_format_issued(char *buf, size_t cap_sz,
 int broker_format_denied(char *buf, size_t cap_sz,
                          const char *cap, const char *reason);
 
-/* Generate an 8-char hex token (32 bits from /dev/urandom). */
-void broker_make_token(char out[BROKER_TOKEN_LEN + 1]);
+/* Generate an 8-char hex token (32 bits from /dev/urandom). Fails closed if
+ * the entropy source cannot provide all bytes. */
+int broker_make_token(char out[BROKER_TOKEN_LEN + 1]);
 
 /* Test whether `cap_name` is permitted by `allow_patterns[]`. Each pattern
  * is exact or wildcard-suffix (e.g. "mailbox.send:*"). Returns 1 if allowed. */

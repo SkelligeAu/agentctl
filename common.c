@@ -98,24 +98,43 @@ const char *agentctl_root(void)
     static int initialized = 0;
     if (initialized) return path;
     const char *override = getenv("AGENTCTL_ROOT");
+    int written;
     if (override && *override) {
-        snprintf(path, sizeof(path), "%s", override);
+        written = snprintf(path, sizeof(path), "%s", override);
     } else {
         const char *xdg = getenv("XDG_RUNTIME_DIR");
         if (xdg && *xdg) {
-            snprintf(path, sizeof(path), "%s/agentctl", xdg);
+            written = snprintf(path, sizeof(path), "%s/agentctl", xdg);
         } else {
-            snprintf(path, sizeof(path), "/tmp/agentctl-%u",
-                     (unsigned)getuid());
+            written = snprintf(path, sizeof(path), "/tmp/agentctl-%u",
+                               (unsigned)getuid());
         }
     }
-    (void)ensure_dir(path, 0700);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        fputs("agentctl: data root path is too long; refusing\n", stderr);
+        exit(1);
+    }
+    if (ensure_dir(path, 0700) != 0) {
+        fprintf(stderr, "agentctl: cannot create data root %s: %s\n",
+                path, strerror(errno));
+        exit(1);
+    }
     if (validate_root_ownership_path(path) != 0) {
         /* helper printed the diagnostic; refuse to proceed. */
         exit(1);
     }
     initialized = 1;
     return path;
+}
+
+static void root_child_path(char *out, size_t n, const char *leaf)
+{
+    int written = snprintf(out, n, "%s/%s", agentctl_root(), leaf);
+    if (written < 0 || (size_t)written >= n) {
+        fprintf(stderr, "agentctl: data root path for %s is too long; refusing\n",
+                leaf);
+        exit(1);
+    }
 }
 
 int agentctl_root_validate_ownership(void)
@@ -156,8 +175,12 @@ const char *agent_root(void)
     static char path[MAX_PATHBUF];
     static int initialized = 0;
     if (initialized) return path;
-    snprintf(path, sizeof(path), "%s/agents", agentctl_root());
-    (void)ensure_dir(path, 0700);
+    root_child_path(path, sizeof(path), "agents");
+    if (ensure_dir(path, 0700) != 0) {
+        fprintf(stderr, "agentctl: cannot create agent root %s: %s\n",
+                path, strerror(errno));
+        exit(1);
+    }
     initialized = 1;
     return path;
 }
@@ -167,7 +190,7 @@ const char *agentd_sock_path(void)
     static char path[MAX_PATHBUF];
     static int initialized = 0;
     if (initialized) return path;
-    snprintf(path, sizeof(path), "%s/agentd.sock", agentctl_root());
+    root_child_path(path, sizeof(path), "agentd.sock");
     initialized = 1;
     return path;
 }
@@ -177,7 +200,7 @@ const char *agentd_pid_path(void)
     static char path[MAX_PATHBUF];
     static int initialized = 0;
     if (initialized) return path;
-    snprintf(path, sizeof(path), "%s/agentd.pid", agentctl_root());
+    root_child_path(path, sizeof(path), "agentd.pid");
     initialized = 1;
     return path;
 }
@@ -187,7 +210,7 @@ const char *agentd_log_path(void)
     static char path[MAX_PATHBUF];
     static int initialized = 0;
     if (initialized) return path;
-    snprintf(path, sizeof(path), "%s/agentd.log", agentctl_root());
+    root_child_path(path, sizeof(path), "agentd.log");
     initialized = 1;
     return path;
 }
@@ -197,7 +220,7 @@ const char *agentd_token_path(void)
     static char path[MAX_PATHBUF];
     static int initialized = 0;
     if (initialized) return path;
-    snprintf(path, sizeof(path), "%s/agentd.token", agentctl_root());
+    root_child_path(path, sizeof(path), "agentd.token");
     initialized = 1;
     return path;
 }
@@ -381,10 +404,19 @@ int read_small_file(const char *path, char *out, size_t n, size_t *out_len)
 int atomic_write_file(const char *path, const void *buf, size_t n, mode_t mode)
 {
     char tmp[MAX_PATHBUF];
-    int r = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int r = snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
     if (r < 0 || (size_t)r >= sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    int fd = mkstemp(tmp);
     if (fd == -1) return -1;
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1 ||
+        fchmod(fd, mode) == -1) {
+        int saved = errno;
+        close(fd);
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
     if (write_all(fd, buf, n) == -1) {
         int saved = errno;
         close(fd); unlink(tmp);
@@ -441,7 +473,11 @@ int read_pid_file(const char *name, pid_t *out)
     char *end;
     errno = 0;
     long v = strtol(buf, &end, 10);
-    if (errno != 0 || v <= 0 || v > INT_MAX) { errno = EINVAL; return -1; }
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (errno != 0 || end == buf || *end != '\0' || v <= 0 || v > INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
     *out = (pid_t)v;
     return 0;
 }
@@ -991,10 +1027,8 @@ int snapshot_state(const char *name, const char *extra_fields)
     time_t now = time(NULL);
     struct tm tm; gmtime_r(&runtime_start_time, &tm);
     char started_at[32];
-    snprintf(started_at, sizeof(started_at),
-             "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    if (strftime(started_at, sizeof(started_at), "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
+        return -1;
 
     char buf[4096];
     size_t off = 0;

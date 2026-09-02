@@ -730,7 +730,19 @@ static void broker_handle_event(struct managed *m)
             return;
         }
         char token[BROKER_TOKEN_LEN + 1];
-        broker_make_token(token);
+        if (broker_make_token(token) != 0) {
+            int saved = errno;
+            close(cap_fd);
+            char resp[BROKER_MSG_MAX];
+            int rl = broker_format_denied(resp, sizeof(resp), req.cap,
+                                          "entropy-failure");
+            if (rl > 0) (void)broker_reply(m->broker_fd, resp, (size_t)rl, -1);
+            daemon_log("broker %s: audit token generation failed: %s",
+                       m->name, strerror(saved));
+            audit_log(m->name, "broker denied cap=%s reason=entropy-failure",
+                      req.cap);
+            return;
+        }
         char resp[BROKER_MSG_MAX];
         int rl = broker_format_issued(resp, sizeof(resp), req.cap, token);
         if (rl <= 0) { close(cap_fd); return; }
@@ -1146,7 +1158,11 @@ static int bind_control_socket(void)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", AGENTD_SOCK);
+    size_t socket_path_len = strlen(AGENTD_SOCK);
+    if (socket_path_len >= sizeof(a.sun_path)) {
+        close(fd); errno = ENAMETOOLONG; return -1;
+    }
+    memcpy(a.sun_path, AGENTD_SOCK, socket_path_len + 1);
     /* Try the bind first. We hold the flock so no live daemon owns this
      * socket; an EADDRINUSE here means a stale unix-socket file from a
      * prior crash. Unlink and retry. */

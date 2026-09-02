@@ -131,7 +131,9 @@ int ipc_listen(const char *agent_name)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof(a.sun_path)) { close(fd); errno = ENAMETOOLONG; return -1; }
+    memcpy(a.sun_path, path, path_len + 1);
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
         int e = errno; close(fd); errno = e; return -1;
     }
@@ -285,7 +287,9 @@ int ipc_connect(const char *target)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof(a.sun_path)) { close(fd); errno = ENAMETOOLONG; return -1; }
+    memcpy(a.sun_path, path, path_len + 1);
     if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
         int e = errno; close(fd);
         if (e == ENOENT || e == ECONNREFUSED) return IPC_PEER_GONE;
@@ -490,6 +494,9 @@ static int parse_inplace(char *buf, size_t total_len, ipc_msg_t *out)
     out->payload_len = 0;
 
     size_t explicit_len = (size_t)-1;
+    unsigned seen = 0;
+    enum { SEEN_VERB = 1u, SEEN_LEN = 2u, SEEN_REPLY = 4u,
+           SEEN_TASK = 8u };
     char *p = buf;
     char *end = buf + header_len;
     while (p < end) {
@@ -498,25 +505,34 @@ static int parse_inplace(char *buf, size_t total_len, ipc_msg_t *out)
         *eol = '\0';
         size_t llen = (size_t)(eol - p);
         if (llen >= 5 && memcmp(p, "VERB ", 5) == 0) {
+            if (seen & SEEN_VERB) return -1;
             const char *v = p + 5;
             while (*v == ' ') v++;
             if (!*v) return -1;
             out->verb = v;
+            seen |= SEEN_VERB;
         } else if (llen >= 4 && memcmp(p, "LEN ", 4) == 0) {
+            if (seen & SEEN_LEN) return -1;
             const char *v = p + 4;
             while (*v == ' ') v++;
             char *endp; errno = 0;
             long n = strtol(v, &endp, 10);
-            if (errno != 0 || n < 0 || (size_t)n > IPC_MSG_HARD_CAP) return -1;
+            if (errno != 0 || endp == v || *endp != '\0' || n < 0 ||
+                (size_t)n > IPC_MSG_HARD_CAP) return -1;
             explicit_len = (size_t)n;
+            seen |= SEEN_LEN;
         } else if (llen >= 9 && memcmp(p, "REPLY-TO ", 9) == 0) {
+            if (seen & SEEN_REPLY) return -1;
             const char *v = p + 9;
             while (*v == ' ') v++;
             out->reply_to = v;
+            seen |= SEEN_REPLY;
         } else if (llen >= 8 && memcmp(p, "TASK-ID ", 8) == 0) {
+            if (seen & SEEN_TASK) return -1;
             const char *v = p + 8;
             while (*v == ' ') v++;
             out->task_id = v;
+            seen |= SEEN_TASK;
         }
         /* Unknown headers ignored — forward-compat. */
         p = eol + 1;
@@ -572,7 +588,8 @@ static int recv_stream_into(int fd, char *buf, size_t bufcap, size_t *out_total)
             nb[k] = '\0';
             char *endp; errno = 0;
             long n = strtol(nb, &endp, 10);
-            if (errno != 0 || n < 0 || (size_t)n > IPC_MSG_HARD_CAP) return IPC_PROTO_VIOLATION;
+            if (errno != 0 || endp == nb || *endp != '\0' || n < 0 ||
+                (size_t)n > IPC_MSG_HARD_CAP) return IPC_PROTO_VIOLATION;
             need = (size_t)n;
             break;
         }

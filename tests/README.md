@@ -53,6 +53,7 @@ to the spawned runtime, so the file-in-cwd convention is used.
 | IPC: `MSG_TRUNC` fatal | `test_ipc_msg_trunc` |
 | IPC: `MSG_CTRUNC` fatal | `test_ipc_msg_ctrunc` |
 | IPC: received fds CLOEXEC | `test_cloexec` |
+| Input: path traversal, duplicate headers, and field truncation rejected | `test_input_validation` |
 | Authority: default-deny | `broker_default_deny.sh` |
 | Authority: wildcard match | `broker_wildcard.sh` |
 | Authority: malformed denied without channel teardown | `broker_malformed.sh` |
@@ -63,7 +64,7 @@ to the spawned runtime, so the file-in-cwd convention is used.
 | Lifecycle: zombie stop reaps inline | F in `agentfs-test.sh` |
 | Lifecycle: `cgroup.kill` subtree termination | F3 in `agentfs-test.sh` |
 
-15 invariants, 15 tests, no TODO.
+16 invariants, 16 tests, no TODO.
 
 ## Protocol fuzzing
 

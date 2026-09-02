@@ -267,14 +267,24 @@ void profile_list(profile_list_cb cb, void *ud)
 
 /* ---------- artifact policy ---------- */
 
+static int valid_artifact_name(const char *name)
+{
+    if (!name) return 0;
+    size_t len = strlen(name);
+    if (len == 0 || len > 127 || name[0] == '.') return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (!(isalnum(c) || c == '_' || c == '-' || c == '.')) return 0;
+    }
+    return 1;
+}
+
 static void timestamp_utc(char *out, size_t n)
 {
     time_t t = time(NULL);
     struct tm tm;
     gmtime_r(&t, &tm);
-    snprintf(out, n, "%04d%02d%02dT%02d%02d%02dZ",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    if (strftime(out, n, "%Y%m%dT%H%M%SZ", &tm) == 0 && n > 0) out[0] = '\0';
 }
 
 static int split_stem_ext(const char *base, char *stem, size_t sn,
@@ -283,7 +293,7 @@ static int split_stem_ext(const char *base, char *stem, size_t sn,
     const char *dot = strrchr(base, '.');
     if (dot && dot != base) {
         size_t sl = (size_t)(dot - base);
-        if (sl >= sn) return -1;
+        if (sl >= sn || strlen(dot) >= en) return -1;
         memcpy(stem, base, sl);
         stem[sl] = '\0';
         snprintf(ext, en, "%s", dot);
@@ -298,6 +308,7 @@ static int split_stem_ext(const char *base, char *stem, size_t sn,
 int write_artifact(const char *agent_name, const char *base_filename,
                    const void *buf, size_t n, artifact_policy_t policy)
 {
+    if (!valid_artifact_name(base_filename)) { errno = EINVAL; return -1; }
     char path[MAX_PATHBUF];
     char rel[256];
 

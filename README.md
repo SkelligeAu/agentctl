@@ -164,7 +164,9 @@ This is a working POC, not production-deployed:
 - Per-uid hardening: ownership-validated data root + `flock`
   single-daemon-per-root gate. Cross-tenant deployment guide at
   `docs/multi-tenant.md`.
-- No fuzzing, no KASAN, no syzkaller, no CI.
+- Broker and IPC parsers have libFuzzer + ASan/UBSan harnesses. CI runs
+  native Linux/macOS builds, the Linux regression suite, and fuzz smoke tests.
+  Longer fuzz campaigns, KASAN, and syzkaller remain follow-up work.
 - macOS compiles and runs for dev only; production semantics depend
   on Linux. See `docs/macos.md`.
 

@@ -7,6 +7,11 @@
 /* "YYYYMMDDTHHMMSSZ-NNNN" = 21 chars. Round up. */
 #define MAX_TASK_ID 32
 
+/* Task ids and artifact names are path components. Keep validation in the
+ * task layer so every caller receives the same traversal protection. */
+int task_validate_id(const char *task_id);
+int task_validate_artifact_name(const char *filename);
+
 typedef enum {
     TASK_QUEUED = 0,
     TASK_RUNNING,

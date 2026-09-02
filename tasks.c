@@ -41,9 +41,32 @@ static int parse_state(const char *s, task_state_t *out)
 
 /* ---------- path helpers ---------- */
 
+static int validate_path_component(const char *value, size_t max_len)
+{
+    if (!value) return -1;
+    size_t len = strlen(value);
+    if (len == 0 || len > max_len || value[0] == '.') return -1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (!(isalnum(c) || c == '_' || c == '-' || c == '.')) return -1;
+    }
+    return 0;
+}
+
+int task_validate_id(const char *task_id)
+{
+    return validate_path_component(task_id, MAX_TASK_ID - 1);
+}
+
+int task_validate_artifact_name(const char *filename)
+{
+    return validate_path_component(filename, 127);
+}
+
 static int task_leaf_path(const char *agent, const char *task_id,
                           const char *leaf, char *out, size_t n)
 {
+    if (task_validate_id(task_id) != 0) { errno = EINVAL; return -1; }
     char rel[256];
     int r = snprintf(rel, sizeof(rel), "tasks/%s%s%s",
                      task_id, leaf[0] ? "/" : "", leaf);
@@ -154,6 +177,7 @@ int task_create(const char *agent, const char *task_id,
                 const char *reply_to, const char *incoming_task_id,
                 const void *payload, size_t payload_len)
 {
+    if (task_validate_id(task_id) != 0) { errno = EINVAL; return -1; }
     /* Ensure tasks/ root exists. */
     char root[MAX_PATHBUF];
     if (tasks_root(agent, root, sizeof(root)) != 0) return -1;
@@ -162,7 +186,8 @@ int task_create(const char *agent, const char *task_id,
     /* Create the per-task dir. */
     char dir[MAX_PATHBUF];
     if (task_dir(agent, task_id, dir, sizeof(dir)) != 0) return -1;
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) return -1;
+    /* Never reopen and overwrite an existing task. */
+    if (mkdir(dir, 0700) != 0) return -1;
 
     /* Sub-dirs. */
     char sub[MAX_PATHBUF];
@@ -293,9 +318,8 @@ void task_iterate(const char *agent, task_iter_cb cb, void *ud)
     int n = 0;
     struct dirent *e;
     while ((e = readdir(d)) != NULL && n < CAP) {
-        if (e->d_name[0] == '.') continue;
+        if (task_validate_id(e->d_name) != 0) continue;
         size_t l = strlen(e->d_name);
-        if (l == 0 || l >= MAX_TASK_ID) continue;
         names[n] = malloc(l + 1);
         if (!names[n]) break;
         memcpy(names[n], e->d_name, l + 1);
@@ -371,15 +395,18 @@ static void timestamp_filename_(char *out, size_t n)
     time_t t = time(NULL);
     struct tm tm;
     gmtime_r(&t, &tm);
-    snprintf(out, n, "%04d%02d%02dT%02d%02d%02dZ",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    if (strftime(out, n, "%Y%m%dT%H%M%SZ", &tm) == 0 && n > 0) out[0] = '\0';
 }
 
 int task_write_artifact(const char *agent, const char *task_id,
                         const char *base_filename,
                         const void *buf, size_t n, int policy)
 {
+    if (task_validate_id(task_id) != 0 ||
+        task_validate_artifact_name(base_filename) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
     char path[MAX_PATHBUF];
     char rel[256];
 
@@ -394,7 +421,10 @@ int task_write_artifact(const char *agent, const char *task_id,
         const char *dot = strrchr(base_filename, '.');
         if (dot && dot != base_filename) {
             size_t sl = (size_t)(dot - base_filename);
-            if (sl >= sizeof(stem)) return -1;
+            if (sl >= sizeof(stem) || strlen(dot) >= sizeof(ext)) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
             memcpy(stem, base_filename, sl);
             stem[sl] = '\0';
             snprintf(ext, sizeof(ext), "%s", dot);
@@ -431,6 +461,10 @@ static int pending_root(const char *agent, char *out, size_t n)
 static int pending_path(const char *agent, const char *task_id,
                         const char *downstream, char *out, size_t n)
 {
+    if (task_validate_id(task_id) != 0 || validate_name(downstream) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
     char root[MAX_PATHBUF];
     if (pending_root(agent, root, sizeof(root)) != 0) return -1;
     int r = snprintf(out, n, "%s/%s.%s", root, task_id, downstream);
@@ -464,6 +498,7 @@ int pending_remove(const char *agent, const char *task_id, const char *downstrea
 
 int pending_count_for_task(const char *agent, const char *task_id)
 {
+    if (task_validate_id(task_id) != 0) { errno = EINVAL; return -1; }
     char root[MAX_PATHBUF];
     if (pending_root(agent, root, sizeof(root)) != 0) return -1;
     DIR *d = opendir(root);

@@ -257,10 +257,9 @@ int main(int argc, char **argv)
             char last_at[32] = "-";
             if (last_message_at) {
                 struct tm tm; gmtime_r(&last_message_at, &tm);
-                snprintf(last_at, sizeof(last_at),
-                         "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                         tm.tm_hour, tm.tm_min, tm.tm_sec);
+                if (strftime(last_at, sizeof(last_at),
+                             "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
+                    snprintf(last_at, sizeof(last_at), "-");
             }
             snprintf(extra, sizeof(extra),
                      "profile: %s\ndispatch: %s\nartifact_policy: %s\n"
