@@ -3,6 +3,8 @@
 `agentctl` runs named processes on a Linux host and lets them pass file
 descriptors to one another through a small capability broker.
 
+Because sometimes the answer really is another file descriptor.
+
 It uses the usual UNIX parts: `AF_UNIX`, `SOCK_SEQPACKET`, `SCM_RIGHTS`,
 `pidfd`, seccomp, Landlock, and cgroup v2. State is kept in ordinary files.
 If something looks wrong, try `ls`, `cat`, `lsof`, or `strace`. The database
@@ -18,7 +20,8 @@ the same user are not isolated from each other.
 - cgroup v2 delegation if cgroup limits are enabled
 
 macOS builds are useful for development, but its STREAM transport and missing
-Linux enforcement primitives are not equivalent to the Linux runtime.
+Linux enforcement primitives are not equivalent to the Linux runtime. It is
+portable in the traditional UNIX sense: most of it compiles.
 
 ## Build
 
@@ -26,7 +29,8 @@ Linux enforcement primitives are not equivalent to the Linux runtime.
 make
 ```
 
-There are no library dependencies beyond libc.
+There are no library dependencies beyond libc. This may upset the package
+manager, which otherwise had plans for your afternoon.
 
 ## First run
 
@@ -46,6 +50,9 @@ printf '+TODO\n+strcpy(a,b);\n' | ./agentctl send rb review
 
 Run `agentctl` without arguments for the command list.
 
+`rb` is just an agent name. Naming things remains outside the scope of this
+project, along with the other impossible problem.
+
 By default, state is stored in `$XDG_RUNTIME_DIR/agentctl`. If that variable is
 unset, `/tmp/agentctl-<uid>` is used. `AGENTCTL_ROOT` overrides both, mostly for
 tests and unusual installations.
@@ -55,7 +62,8 @@ tests and unusual installations.
 `agentd` owns process lifecycle and the capability broker. Each supervised
 process inherits a private broker socket on fd 3. An agent can request a
 capability named in its policy file; the current implementation supports
-`mailbox.send:<agent>`.
+`mailbox.send:<agent>`. Fds 0, 1, and 2 were already taken by historical
+mistakes we have learned to live with.
 
 A successful request creates a fresh socketpair. One end goes to the requester
 and the other to the target's private inbox. `agentd` keeps neither end. The
@@ -75,7 +83,9 @@ payload
 
 Linux uses `SOCK_SEQPACKET`: one send is one message. Truncated frames,
 truncated ancillary data, duplicate headers, invalid lengths, and oversized
-fields are rejected. Received descriptors are marked close-on-exec.
+fields are rejected. Two `LEN` headers are treated as a protocol violation,
+not an invitation to form a standards committee. Received descriptors are
+marked close-on-exec.
 
 ## Supervision
 
@@ -91,7 +101,8 @@ Profiles can apply:
 - cgroup memory, process, and CPU limits
 - restart and artifact policies
 
-Profiles are read when a process starts. They are not hot-reloaded.
+Profiles are read when a process starts. They are not hot-reloaded. Change the
+file and restart the process, as Thompson and Ritchie intended.
 
 ## Security model
 
@@ -103,11 +114,13 @@ checks peer credentials and requires a random per-root authentication token.
 Agents running as the same uid can still use `ptrace`, signals, `/proc`, and
 descriptor forwarding against each other. If they do not trust one another,
 give them separate users, namespaces, or virtual machines. No amount of
-adjectives in this README changes what the kernel permits.
+adjectives in this README changes what the kernel permits. UNIX assumes a uid
+is a family, and families know where the bodies are buried.
 
 Other limits worth knowing:
 
-- a delivered fd cannot be revoked from another process; restart the holder
+- a delivered fd cannot be revoked from another process; UNIX has no
+  take-backsies, so restart the holder
 - network egress is not blocked by default
 - audit logs are useful, not cryptographically tamper-evident
 - direct mode retains cooperative pathname mailboxes
@@ -135,14 +148,16 @@ tests/fuzz/fuzz-ipc tests/fuzz/corpus/ipc -max_total_time=60
 ```
 
 `tests/README.md` has the test matrix. QEMU integration support lives under
-`kernel/dev` for tests that need real Linux kernel facilities.
+`kernel/dev` for tests that need real Linux kernel facilities. A passing test
+suite means the remaining bugs have become more interesting.
 
 ## Status
 
 This is a working prototype. It builds on Linux and macOS, passes the Linux
 regression suite, and has sanitizer-backed parser fuzzing. It has not had the
 independent review, soak testing, packaging, or operational abuse required for
-a production release.
+a production release. Please do not infer an SLA from the presence of a
+Makefile.
 
 Delegation, leases, and filesystem capability issuance are not implemented.
 The `agentfs` kernel module is a research artifact, not a second production
