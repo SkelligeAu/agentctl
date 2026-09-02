@@ -106,14 +106,22 @@ static int run_many_fds(void)
     /* Open 8 spurious fds. agentd's cmsg buffer holds 4; the kernel will
      * deliver 4 and set MSG_CTRUNC on the remainder. agentd's contract is
      * to treat MSG_CTRUNC as fatal: close the channel. */
+    int source_fd = open("broker-fault-mode", O_RDONLY | O_CLOEXEC);
+    if (source_fd < 0) {
+        fprintf(stderr, "broker-fault many-fds: open source: %s\n",
+                strerror(errno));
+        return 1;
+    }
     int fds[8];
     for (int i = 0; i < 8; i++) {
-        fds[i] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        fds[i] = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
         if (fds[i] < 0) {
-            fprintf(stderr, "broker-fault many-fds: open: %s\n", strerror(errno));
+            fprintf(stderr, "broker-fault many-fds: dup: %s\n", strerror(errno));
+            close(source_fd);
             return 1;
         }
     }
+    close(source_fd);
     /* Build a header that broker_parse would accept (the cmsg overflow
      * triggers before parse runs). */
     const char *hdr = "VERB request\nCAP mailbox.send:peer\n\n";
@@ -163,7 +171,8 @@ static int run_fdtable(void)
         int fd = atoi(e->d_name);
         char link[256] = {0};
         char path[256];
-        snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
+        int written = snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
+        if (written < 0 || (size_t)written >= sizeof(path)) continue;
         ssize_t n = readlink(path, link, sizeof(link) - 1);
         if (n < 0) n = 0;
         link[n] = 0;
@@ -189,7 +198,13 @@ static int run_oversized(const char *target)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof(a.sun_path)) {
+        fputs("socket path too long\n", stderr);
+        close(fd);
+        return 1;
+    }
+    memcpy(a.sun_path, path, path_len + 1);
     if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
         perror("connect");
         close(fd);

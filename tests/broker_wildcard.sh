@@ -19,13 +19,21 @@ sleep 0.3
 
 agentctl create "$REQ" --profile worker > /dev/null
 agentctl grant  "$REQ" 'mailbox.send:*' > /dev/null
-echo "$TGT" > "$AAGENTS/$REQ/broker-target"
+echo "$TGT" > "$AAGENTS/$REQ/data/broker-target"
 
 agentctl start "$REQ" --exec "$(command -v broker-test)" > /dev/null
 sleep 0.5
 
 if ! grep -q "broker issued cap=mailbox.send:$TGT to=$REQ" "$ALOG"; then
     echo "FAIL: wildcard did not allow mailbox.send:$TGT"
+    exit 1
+fi
+if [ -S "$AAGENTS/$TGT/data/agent.sock" ] || [ -S "$AAGENTS/$TGT/agent.sock" ]; then
+    echo "FAIL: supervised target exposed a pathname mailbox"
+    exit 1
+fi
+if ! grep -q "recv verb=hello from=$REQ" "$AAGENTS/$TGT/data/audit.log"; then
+    echo "FAIL: receiver did not observe broker-authenticated sender identity"
     exit 1
 fi
 echo "PASS: wildcard 'mailbox.send:*' grants matching caps"

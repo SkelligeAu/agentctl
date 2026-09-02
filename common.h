@@ -20,6 +20,9 @@
 #define MAX_PAYLOAD       (1u << 20)   /* 1 MiB */
 #define MAX_PATHBUF       4096
 #define AUDIT_TAIL_LINES  20
+#define BROKER_FD_SLOT     3
+#define INBOX_FD_SLOT      4
+#define BROKER_LOCK_FD_SLOT 5
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define PRINTF_FMT(a,b) __attribute__((format(printf,(a),(b))))
@@ -42,6 +45,7 @@ const char *agent_root(void);
 const char *agentd_sock_path(void);
 const char *agentd_pid_path(void);
 const char *agentd_log_path(void);
+const char *agentd_token_path(void);
 
 /* Acquire an exclusive lockfile at <agentctl_root>/agentd.lock to enforce
  * one daemon per data root. Returns an open fd which the caller MUST keep
@@ -62,11 +66,17 @@ int  agentctl_root_validate_ownership(void);
  * `const char *` (snprintf format args, opendir, ensure_dir) keep working. */
 #define AGENT_ROOT  agent_root()
 
-/* Name + path helpers */
+/* Name + path helpers. Each agent has operator config/, runtime metadata/,
+ * and agent-writable data/. agent_path routes known leaves to the canonical
+ * class and defaults application-specific leaves to data/. */
 int  validate_name(const char *name);
 int  ensure_dir(const char *path, mode_t mode);
 int  agent_dir(char *out, size_t n, const char *name);
+int  agent_config_dir(char *out, size_t n, const char *name);
+int  agent_runtime_dir(char *out, size_t n, const char *name);
+int  agent_data_dir(char *out, size_t n, const char *name);
 int  agent_path(char *out, size_t n, const char *name, const char *leaf);
+int  agent_ensure_layout(const char *name);
 
 /* IO helpers */
 ssize_t read_all(int fd, void *buf, size_t n);              /* retries EINTR */
@@ -149,13 +159,15 @@ typedef struct {
     pid_t pid;
     uid_t uid;
     gid_t gid;
+    char authenticated_name[MAX_NAME]; /* broker-authenticated, else "" */
 } peer_id_t;
 
-/* Build/listen on <root>/agents/<name>/agent.sock. Returns server fd. */
+/* Return inherited fd 4 under agentd, or build a legacy pathname listener in
+ * direct mode. */
 int  create_server_socket(const char *name);
 
-/* Connect to <root>/agents/<target>/agent.sock.
- * Returns fd, or -2 if no listener (ENOENT/ECONNREFUSED), or -1 on other err. */
+/* Request a broker-minted connection via fd 3 under agentd; direct mode falls
+ * back to the legacy pathname listener. */
 int  connect_agent(const char *target);
 
 /* Accept one client; capture peer creds; install a recv timeout.
@@ -223,8 +235,8 @@ void apply_limits_from_file(const char *path);
  * + limits + argv[0]="agent:<name>", waits briefly for the runtime to flip
  * status off "starting". Returns 0 on success and stores the child pid in
  * out_pid; -1 on error (errno set). cwd / inheritance for the child:
- *   - setsid, chdir(<root>/agents/<name>), redirect stdio to audit.log
- *   - apply_limits_from_file("limits")
+ *   - setsid, chdir(<root>/agents/<name>/data), redirect stdio to audit.log
+ *   - apply limits from the operator-controlled config/limits
  *   - enforcement_child_apply
  *   - execl(runtime_path, "agent:<name>", name, NULL)
  * fs_override / sc_override / cg_override use the same -1=profile-default,
@@ -232,12 +244,15 @@ void apply_limits_from_file(const char *path);
 /* If `out_broker_fd` is non-NULL, a SOCK_SEQPACKET (Linux) or SOCK_STREAM
  * (macOS) socketpair is created; the child's end is dup2'd to fd 3 in the
  * spawned runtime (BROKER_FD_SLOT); the parent end is stored in *out_broker_fd
- * for the caller (agentd) to read broker requests from. Pass NULL to skip. */
+ * for the caller (agentd) to read broker requests from. The receiver inbox
+ * channel uses SOCK_DGRAM so each SCM_RIGHTS delivery retains boundaries.
+ * Pass NULL to skip. */
 int spawn_agent_runtime(const char *name, const char *runtime_path,
                         const char *supervisor_label,
                         int fs_override, int sc_override, int cg_override,
                         pid_t *out_pid,
-                        int *out_broker_fd);
+                        int *out_broker_fd,
+                        int *out_inbox_fd);
 
 /* Misc */
 int refuse_root(void);

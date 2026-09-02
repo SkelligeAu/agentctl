@@ -21,7 +21,7 @@ if ! grep -q "broker $NAME: oversized or cmsg-truncated" "$ALOG"; then
     echo "FAIL: agentd did not report MSG_CTRUNC"
     exit 1
 fi
-if ! grep -q "broker protocol violation" "$AAGENTS/$NAME/audit.log"; then
+if ! grep -q "broker protocol violation" "$AAGENTS/$NAME/data/audit.log"; then
     echo "FAIL: agent's audit.log missing protocol-violation entry"
     exit 1
 fi

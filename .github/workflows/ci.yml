@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -j2
+
+  linux-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -j2
+      - name: Run regression suite
+        shell: bash
+        run: |
+          export PATH="$PWD:$PATH"
+          export AGENTCTL_ROOT="$RUNNER_TEMP/agentctl-suite"
+          mkdir -p "$AGENTCTL_ROOT"
+          chmod 700 "$AGENTCTL_ROOT"
+          agentd >"$RUNNER_TEMP/agentd.out" 2>&1 &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
+          for _ in {1..10}; do
+            [[ -S "$AGENTCTL_ROOT/agentd.sock" ]] && break
+            sleep 1
+          done
+          sh tests/run-all.sh
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fuzz targets
+        run: make fuzz
+      - name: Exercise broker parser
+        run: tests/fuzz/fuzz-broker tests/fuzz/corpus/broker -runs=100000
+      - name: Exercise IPC parser
+        run: tests/fuzz/fuzz-ipc tests/fuzz/corpus/ipc -runs=100000

@@ -18,7 +18,7 @@ echo malformed > "$AAGENTS/$NAME/broker-fault-mode"
 agentctl start "$NAME" --exec "$(command -v broker-fault)" > /dev/null
 sleep 0.5
 
-if ! grep -q "broker malformed request" "$AAGENTS/$NAME/audit.log"; then
+if ! grep -q "broker malformed request" "$AAGENTS/$NAME/data/audit.log"; then
     echo "FAIL: no 'broker malformed' line in $NAME audit.log"
     exit 1
 fi

@@ -81,17 +81,17 @@ typedef struct {
  * Lifecycle
  * ---------------------------------------------------------------- */
 
-/* Create a listening socket bound to <root>/agents/<name>/agent.sock.
- * Sets SOCK_CLOEXEC | SOCK_NONBLOCK on the listener. Linux: SEQPACKET.
- * macOS: STREAM. Returns server fd or -1 (errno). */
+/* Return the inherited inbox-delivery channel (fd 4) when supervised by
+ * agentd. Direct mode creates a legacy pathname listener. */
 int  ipc_listen(const char *agent_name);
 
-/* Accept one client. Captures peer creds. Result fd has SOCK_CLOEXEC set.
+/* Receive one broker-delivered client fd (or accept in direct mode). Captures
+ * broker-authenticated agent identity when available. Result fd has CLOEXEC.
  * Returns client fd or -1 (errno; EAGAIN/EWOULDBLOCK propagate). */
 int  ipc_accept(int server_fd, peer_id_t *out_peer);
 
-/* Connect to <root>/agents/<target>/agent.sock.
- * Returns connected fd, IPC_PEER_GONE if no listener, or -1 on other error. */
+/* Acquire mailbox.send:<target> through inherited broker fd 3. Direct mode
+ * falls back to a pathname connection. */
 int  ipc_connect(const char *target);
 
 /* Close the listener and unlink the socket path. */
@@ -113,6 +113,11 @@ int  ipc_send(int fd, const ipc_msg_t *msg);
  * On IPC_OK, out_msg pointers refer into buf and out_msg->peer is filled.
  * Returns IPC_OK, IPC_ERR, IPC_PEER_GONE (EOF), or IPC_PROTO_VIOLATION. */
 int  ipc_recv(int fd, void *buf, size_t bufcap, ipc_msg_t *out_msg);
+
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+/* Exposes the production in-place frame parser only to sanitizer fuzz builds. */
+int ipc_parse_for_fuzz(char *buf, size_t len, ipc_msg_t *out_msg);
+#endif
 
 /* Convenience: connect + send + close. Builds the message frame from the
  * provided header fields and payload bytes; no caller-side buffer required.

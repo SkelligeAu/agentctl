@@ -4,6 +4,11 @@
 
 set -e
 . "$(dirname "$0")/_lib.sh"
+
+if [ "$(uname -s)" != Linux ]; then
+    echo "skip: linux-only (/proc fd inspection)"
+    exit 77
+fi
 NAME=tpa-req
 
 cleanup() {
@@ -15,11 +20,11 @@ trap cleanup EXIT
 agentctl create "$NAME" --profile worker > /dev/null
 agentctl grant "$NAME" 'mailbox.send:peer-that-does-not-exist' > /dev/null
 
-echo fdtable > "$AAGENTS/$NAME/broker-fault-mode"
+echo fdtable > "$AAGENTS/$NAME/data/broker-fault-mode"
 agentctl start "$NAME" --exec "$(command -v broker-fault)" > /dev/null
 sleep 0.4
 
-FDT="$AAGENTS/$NAME/fdtable"
+FDT="$AAGENTS/$NAME/data/fdtable"
 if [ ! -f "$FDT" ]; then
     echo "FAIL: fdtable not produced by broker-fault"
     exit 1

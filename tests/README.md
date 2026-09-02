@@ -33,10 +33,11 @@ All three are Linux-only and `_exit(77)` on non-Linux platforms.
 | File | Asserts |
 |---|---|
 | `broker_default_deny.sh` | Empty `policy` → broker emits `denied: not-in-caps` and no fd is delivered |
-| `broker_wildcard.sh` | `allow mailbox.send:*` permits a `mailbox.send:<peer>` issuance |
+| `broker_wildcard.sh` | Wildcard issuance works, the target exposes no pathname mailbox, and the receiver observes broker-authenticated sender identity |
 | `broker_malformed.sh` | Malformed broker request → `denied: malformed-request` AND the broker channel remains usable for a second request |
 | `broker_msg_ctrunc.sh` | A request carrying more SCM_RIGHTS fds than agentd's cmsg buffer holds → agentd closes the channel and logs the protocol violation |
 | `policy_not_authority.sh` | A granted policy line does NOT pre-materialize as an open fd in the holder's fd table; only broker issuance does |
+| `phase1_authority_boundary.sh` | A Landlock-confined child cannot modify `config/policy`, and an unauthenticated control-socket command is rejected |
 | `broker_no_state.sh` | After 5 broker issuances + 5 process exits, agentd's `/proc/<pid>/fd/` count returns to its starting value (broker holds no per-issuance state) |
 
 The broker drivers use `broker-fault` for fault injection. Modes
@@ -52,6 +53,7 @@ to the spawned runtime, so the file-in-cwd convention is used.
 | IPC: `MSG_TRUNC` fatal | `test_ipc_msg_trunc` |
 | IPC: `MSG_CTRUNC` fatal | `test_ipc_msg_ctrunc` |
 | IPC: received fds CLOEXEC | `test_cloexec` |
+| Input: path traversal, duplicate headers, and field truncation rejected | `test_input_validation` |
 | Authority: default-deny | `broker_default_deny.sh` |
 | Authority: wildcard match | `broker_wildcard.sh` |
 | Authority: malformed denied without channel teardown | `broker_malformed.sh` |
@@ -62,7 +64,22 @@ to the spawned runtime, so the file-in-cwd convention is used.
 | Lifecycle: zombie stop reaps inline | F in `agentfs-test.sh` |
 | Lifecycle: `cgroup.kill` subtree termination | F3 in `agentfs-test.sh` |
 
-12 invariants, 12 tests, no TODO.
+16 invariants, 16 tests, no TODO.
+
+## Protocol fuzzing
+
+Build the production broker and IPC parsers with libFuzzer, AddressSanitizer,
+and UndefinedBehaviorSanitizer:
+
+```sh
+make fuzz
+tests/fuzz/fuzz-broker tests/fuzz/corpus/broker -max_total_time=60
+tests/fuzz/fuzz-ipc tests/fuzz/corpus/ipc -max_total_time=60
+```
+
+The IPC harness exposes `parse_inplace` through a fuzz-build-only wrapper;
+normal binaries do not export that entry point. Seed corpora cover valid,
+malformed, length-framed, and payload-bearing messages.
 
 ## What is intentionally not tested
 

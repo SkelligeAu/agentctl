@@ -55,6 +55,9 @@
 #define MAX_MANAGED 32
 #define RECONCILE_INTERVAL_SEC 5      /* fallback polling cadence (no inotify) */
 #define INOTIFY_SAFETY_SEC     60     /* belt-and-braces full rescan with inotify */
+#define RESTART_STABLE_SEC     30
+#define RESTART_BACKOFF_MAX_SEC 30
+#define RESTART_BURST_LIMIT    5
 
 /* ---------- per-agent state in agentd ---------- */
 
@@ -66,8 +69,11 @@ struct managed {
     pid_t   pid;                  /* 0 if not running; otherwise our child */
     int     pidfd;                /* -1 unless we hold a pidfd for `pid` (Linux only) */
     int     broker_fd;            /* -1 unless agentd's end of broker socketpair */
+    int     inbox_fd;             /* -1 unless agentd's receiver-delivery channel */
     int     restart_count;
+    int     consecutive_failures;
     time_t  last_started_at;
+    time_t  next_restart_at;
     int     external;             /* 1 if we observed it but didn't spawn it */
 };
 
@@ -139,6 +145,7 @@ static struct managed *alloc_slot(const char *name)
             g_agents[i].used = 1;
             g_agents[i].pidfd = -1;
             g_agents[i].broker_fd = -1;
+            g_agents[i].inbox_fd = -1;
             snprintf(g_agents[i].name, sizeof(g_agents[i].name), "%s", name);
             return &g_agents[i];
         }
@@ -153,6 +160,7 @@ static void clear_runtime_state(struct managed *m)
     if (!m) return;
     if (m->pidfd >= 0)     { close(m->pidfd);     m->pidfd = -1; }
     if (m->broker_fd >= 0) { close(m->broker_fd); m->broker_fd = -1; }
+    if (m->inbox_fd >= 0)  { close(m->inbox_fd);  m->inbox_fd = -1; }
     m->pid = 0;
 }
 
@@ -161,6 +169,7 @@ static void release_slot(struct managed *m)
     if (!m) return;
     if (m->pidfd >= 0)     { close(m->pidfd);     m->pidfd = -1; }
     if (m->broker_fd >= 0) { close(m->broker_fd); m->broker_fd = -1; }
+    if (m->inbox_fd >= 0)  { close(m->inbox_fd);  m->inbox_fd = -1; }
     memset(m, 0, sizeof(*m));
 }
 
@@ -217,9 +226,9 @@ static int spawn_agent(struct managed *m)
         return -1;
     }
     pid_t pid = 0;
-    int broker_fd = -1;
+    int broker_fd = -1, inbox_fd = -1;
     if (spawn_agent_runtime(m->name, runtime_path, "agentd",
-                            -1, -1, -1, &pid, &broker_fd) != 0) {
+                            -1, -1, -1, &pid, &broker_fd, &inbox_fd) != 0) {
         daemon_log("start %s: spawn failed: %s", m->name, strerror(errno));
         audit_log(m->name, "agentd: spawn failed: %s", strerror(errno));
         return -1;
@@ -227,6 +236,7 @@ static int spawn_agent(struct managed *m)
     m->pid = pid;
     m->external = 0;
     m->last_started_at = time(NULL);
+    m->next_restart_at = 0;
     /* Acquire a pidfd race-free against PID reuse. v1: fork + pidfd_open;
      * micro-race window between fork() and this open is acceptable per the
      * lifecycle invariant. clone3(CLONE_PIDFD) is the strict-mode upgrade. */
@@ -239,8 +249,9 @@ static int spawn_agent(struct managed *m)
     }
     /* Hold the agentd-side end of the broker socketpair; runtime got fd 3. */
     m->broker_fd = broker_fd;
-    daemon_log("started %s pid=%ld pidfd=%d broker_fd=%d",
-               m->name, (long)pid, m->pidfd, m->broker_fd);
+    m->inbox_fd = inbox_fd;
+    daemon_log("started %s pid=%ld pidfd=%d broker_fd=%d inbox_fd=%d",
+               m->name, (long)pid, m->pidfd, m->broker_fd, m->inbox_fd);
     return 0;
 }
 
@@ -336,6 +347,8 @@ static void reap_zombies(void)
         if (pid <= 0) break;
         struct managed *m = find_by_pid(pid);
         if (!m) continue;
+        time_t now = time(NULL);
+        time_t uptime = m->last_started_at > 0 ? now - m->last_started_at : 0;
         clear_runtime_state(m);
         int code = 0;
         int signum = 0;
@@ -361,21 +374,35 @@ static void reap_zombies(void)
         if (!should) {
             audit_log(m->name, "no restart (policy=%s)",
                       p == POLICY_NEVER ? "never" : "on-failure");
+            /* Reconciliation treats desired_state=running as an instruction
+             * to start a missing process. Persist the terminal decision or a
+             * clean one-shot runtime would be relaunched on the next scan. */
+            write_agent_setting(m->name, "desired_state", "stopped");
             continue;
         }
-        audit_log(m->name, "restart scheduled policy=%s",
-                  p == POLICY_ALWAYS ? "always" : "on-failure");
+        if (uptime >= RESTART_STABLE_SEC) m->consecutive_failures = 0;
+        m->consecutive_failures++;
         m->restart_count++;
         persist_restart_count(m);
-        /* Crude backoff: 1s flat. */
-        struct timespec ts = { 1, 0 };
-        nanosleep(&ts, NULL);
-        if (spawn_agent(m) != 0) {
-            audit_log(m->name, "restart failed");
-        } else {
-            audit_log(m->name, "restarted pid=%ld restart_count=%d",
-                      (long)m->pid, m->restart_count);
+        if (m->consecutive_failures >= RESTART_BURST_LIMIT) {
+            audit_log(m->name,
+                      "restart suppressed crash-loop failures=%d window=%ds",
+                      m->consecutive_failures, RESTART_STABLE_SEC);
+            daemon_log("%s restart suppressed after %d short runs",
+                       m->name, m->consecutive_failures);
+            write_status(m->name, "crash-loop");
+            write_agent_setting(m->name, "desired_state", "stopped");
+            m->next_restart_at = 0;
+            continue;
         }
+        int shift = m->consecutive_failures - 1;
+        int delay = shift >= 5 ? RESTART_BACKOFF_MAX_SEC : (1 << shift);
+        if (delay > RESTART_BACKOFF_MAX_SEC) delay = RESTART_BACKOFF_MAX_SEC;
+        m->next_restart_at = now + delay;
+        audit_log(m->name,
+                  "restart scheduled policy=%s delay=%ds failure=%d",
+                  p == POLICY_ALWAYS ? "always" : "on-failure", delay,
+                  m->consecutive_failures);
     }
 }
 
@@ -463,8 +490,16 @@ static void reconcile_cb_(const char *name, void *ud)
     if (enabled && desire && !alive) {
         if (!m) m = alloc_slot(name);
         if (m) {
+            time_t now = time(NULL);
+            if (m->next_restart_at > now) return;
             audit_log(name, "agentd: reconcile -> start");
-            (void)spawn_agent(m);
+            if (spawn_agent(m) != 0) {
+                audit_log(name, "agentd: restart spawn failed");
+                m->next_restart_at = now + 1;
+            } else if (m->restart_count > 0) {
+                audit_log(name, "restarted pid=%ld restart_count=%d",
+                          (long)m->pid, m->restart_count);
+            }
         }
         return;
     }
@@ -475,16 +510,44 @@ static void reconcile_cb_(const char *name, void *ud)
     }
 }
 
+/* Bound poll by the earliest scheduled restart so inotify-enabled systems do
+ * not defer backoff expiry until the 60-second safety scan. */
+static int scheduled_restart_timeout_ms(int fallback_ms)
+{
+    time_t now = time(NULL);
+    int best = fallback_ms;
+    for (int i = 0; i < MAX_MANAGED; i++) {
+        struct managed *m = &g_agents[i];
+        if (!m->used || m->pid > 0 || m->next_restart_at <= 0) continue;
+        long ms = (long)(m->next_restart_at - now) * 1000L;
+        if (ms < 0) ms = 0;
+        if (ms < best) best = (int)ms;
+    }
+    return best;
+}
+
+static int scheduled_restart_due(void)
+{
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_MANAGED; i++)
+        if (g_agents[i].used && g_agents[i].pid <= 0 &&
+            g_agents[i].next_restart_at > 0 &&
+            g_agents[i].next_restart_at <= now)
+            return 1;
+    return 0;
+}
+
 /* ---------- capability broker (v1) ----------
  *
  * Per-agent broker channel handler. Reads one request from m->broker_fd,
- * checks the requester's <root>/agents/<name>/caps file for an `allow`
+ * checks the requester's config/policy file for an `allow`
  * pattern matching the requested cap name, and either issues the cap fd
  * via SCM_RIGHTS or sends a denial.
  *
  * v1 supports exactly one cap kind: mailbox.send:<target>. The broker
- * connects to the target's agent.sock, hands the connected fd to the
- * requester, and closes its own copy. All subsequent traffic on that fd
+ * mints a socketpair, delivers one end plus authenticated requester metadata
+ * to the target over fd 4, hands the other end to the requester, and closes
+ * its copies. All subsequent traffic on that fd
  * flows agent-to-agent without going through agentd. The broker NEVER
  * buffers, stores, retries, or replays application messages — it only
  * transfers authority. */
@@ -544,6 +607,47 @@ static int broker_reply(int chan_fd, const char *bytes, size_t len, int fd_or_ne
     do { n = sendmsg(chan_fd, &mh, MSG_NOSIGNAL); }
     while (n < 0 && errno == EINTR);
     return (n < 0) ? -1 : 0;
+}
+
+static int issue_mailbox_channel(const char *sender, pid_t sender_pid,
+                                 uid_t sender_uid, const char *target,
+                                 int *out_sender_fd)
+{
+    struct managed *dst = find_by_name(target);
+    if (!dst || dst->pid <= 0 || dst->inbox_fd < 0 || !agent_alive(dst)) {
+        errno = ENOENT; return -2;
+    }
+    int stype =
+#if defined(__linux__)
+        SOCK_SEQPACKET;
+#else
+        SOCK_STREAM;
+#endif
+    int sv[2];
+    if (socketpair(AF_UNIX, stype, 0, sv) != 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        int fl = fcntl(sv[i], F_GETFD);
+        if (fl != -1) (void)fcntl(sv[i], F_SETFD, fl | FD_CLOEXEC);
+    }
+    char meta[256];
+    int ml = snprintf(meta, sizeof(meta), "SENDER %s\nPID %ld\nUID %ld\n\n",
+                      sender, (long)sender_pid, (long)sender_uid);
+    struct iovec iov = { .iov_base = meta, .iov_len = (size_t)ml };
+    char control[CMSG_SPACE(sizeof(int))];
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_iov = &iov; mh.msg_iovlen = 1;
+    mh.msg_control = control; mh.msg_controllen = sizeof(control);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &sv[1], sizeof(int));
+    ssize_t n;
+    do { n = sendmsg(dst->inbox_fd, &mh, MSG_NOSIGNAL); } while (n < 0 && errno == EINTR);
+    close(sv[1]);
+    if (n < 0) { int saved = errno; close(sv[0]); errno = saved; return -1; }
+    *out_sender_fd = sv[0];
+    return 0;
 }
 
 static void broker_handle_event(struct managed *m)
@@ -612,9 +716,11 @@ static void broker_handle_event(struct managed *m)
     /* Dispatch by cap kind. v1: mailbox.send:<target> only. */
     if (strncmp(req.cap, "mailbox.send:", 13) == 0) {
         const char *target = req.cap + 13;
-        int cap_fd = broker_open_mailbox_send(target);
-        if (cap_fd < 0) {
-            const char *reason = (cap_fd == -2) ? "no-listener" : strerror(errno);
+        int cap_fd = -1;
+        int issue_rc = issue_mailbox_channel(m->name, m->pid, getuid(),
+                                             target, &cap_fd);
+        if (issue_rc < 0) {
+            const char *reason = (issue_rc == -2) ? "no-listener" : strerror(errno);
             char resp[BROKER_MSG_MAX];
             int rl = broker_format_denied(resp, sizeof(resp), req.cap, reason);
             if (rl > 0) (void)broker_reply(m->broker_fd, resp, (size_t)rl, -1);
@@ -624,7 +730,19 @@ static void broker_handle_event(struct managed *m)
             return;
         }
         char token[BROKER_TOKEN_LEN + 1];
-        broker_make_token(token);
+        if (broker_make_token(token) != 0) {
+            int saved = errno;
+            close(cap_fd);
+            char resp[BROKER_MSG_MAX];
+            int rl = broker_format_denied(resp, sizeof(resp), req.cap,
+                                          "entropy-failure");
+            if (rl > 0) (void)broker_reply(m->broker_fd, resp, (size_t)rl, -1);
+            daemon_log("broker %s: audit token generation failed: %s",
+                       m->name, strerror(saved));
+            audit_log(m->name, "broker denied cap=%s reason=entropy-failure",
+                      req.cap);
+            return;
+        }
         char resp[BROKER_MSG_MAX];
         int rl = broker_format_issued(resp, sizeof(resp), req.cap, token);
         if (rl <= 0) { close(cap_fd); return; }
@@ -661,7 +779,8 @@ static void inotify_add_agent(const char *name)
 {
     if (g_inotify_fd == -1) return;
     char path[MAX_PATHBUF];
-    if (agent_dir(path, sizeof(path), name) != 0) return;
+    if (agent_ensure_layout(name) != 0 ||
+        agent_config_dir(path, sizeof(path), name) != 0) return;
     for (int i = 0; i < MAX_MANAGED; i++) {
         if (g_watches[i].wd != 0 && strcmp(g_watches[i].name, name) == 0) return;
     }
@@ -811,6 +930,9 @@ static int handle_cmd_start(const char *name, char *resp, size_t n)
         snprintf(resp, n, "OK already running pid=%ld", (long)m->pid);
         return 0;
     }
+    /* An explicit operator start clears crash-loop suppression state. */
+    m->consecutive_failures = 0;
+    m->next_restart_at = 0;
     if (spawn_agent(m) != 0) {
         snprintf(resp, n, "ERROR spawn failed: %s", strerror(errno));
         return 1;
@@ -962,7 +1084,37 @@ static void serve_one_connection(int srv)
     if (nl) *nl = '\0';
 
     char resp[512];
-    (void)handle_command(line, resp, sizeof(resp));
+    char expected[129];
+    if (read_small_file(agentd_token_path(), expected, sizeof(expected), NULL) != 0) {
+        snprintf(resp, sizeof(resp), "ERROR control authentication unavailable");
+    } else {
+        expected[strcspn(expected, "\r\n")] = '\0';
+        const char *command = line;
+        int authenticated = 0;
+        if (strncmp(command, "AUTH ", 5) == 0) {
+            const char *presented = command + 5;
+            const char *space = strchr(presented, ' ');
+            if (space && (size_t)(space - presented) == strlen(expected) &&
+                memcmp(presented, expected, strlen(expected)) == 0) {
+                authenticated = 1;
+                command = space + 1;
+            }
+        }
+        if (!authenticated) snprintf(resp, sizeof(resp), "ERROR unauthorized");
+        else if (strncmp(command, "issue ", 6) == 0) {
+            const char *target = command + 6;
+            int capfd = -1;
+            if (validate_name(target) != 0 ||
+                issue_mailbox_channel("operator", peer.pid, peer.uid,
+                                      target, &capfd) != 0) {
+                snprintf(resp, sizeof(resp), "ERROR no-listener");
+            } else {
+                static const char ok[] = "OK issued\n";
+                (void)broker_reply(fd, ok, sizeof(ok) - 1, capfd);
+                close(capfd); close(fd); return;
+            }
+        } else (void)handle_command(command, resp, sizeof(resp));
+    }
     size_t rl = strlen(resp);
     if (rl < sizeof(resp) - 1) { resp[rl++] = '\n'; resp[rl] = '\0'; }
     (void)!write_all(fd, resp, rl);
@@ -1006,7 +1158,11 @@ static int bind_control_socket(void)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", AGENTD_SOCK);
+    size_t socket_path_len = strlen(AGENTD_SOCK);
+    if (socket_path_len >= sizeof(a.sun_path)) {
+        close(fd); errno = ENAMETOOLONG; return -1;
+    }
+    memcpy(a.sun_path, AGENTD_SOCK, socket_path_len + 1);
     /* Try the bind first. We hold the flock so no live daemon owns this
      * socket; an EADDRINUSE here means a stale unix-socket file from a
      * prior crash. Unlink and retry. */
@@ -1032,6 +1188,35 @@ static void write_pid_file(void)
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%ld\n", (long)getpid());
     if (n > 0) atomic_write_file(AGENTD_PID, buf, (size_t)n, 0600);
+}
+
+static int ensure_control_token(void)
+{
+    const char *path = agentd_token_path();
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0077)) {
+            errno = EACCES;
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT) return -1;
+    unsigned char raw[32];
+    int rfd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (rfd == -1) return -1;
+    ssize_t got = read_all(rfd, raw, sizeof(raw));
+    int saved = errno;
+    close(rfd);
+    if (got != (ssize_t)sizeof(raw)) { errno = saved ? saved : EIO; return -1; }
+    static const char hex[] = "0123456789abcdef";
+    char token[65];
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        token[i * 2] = hex[raw[i] >> 4];
+        token[i * 2 + 1] = hex[raw[i] & 15];
+    }
+    token[64] = '\n';
+    return atomic_write_file(path, token, sizeof(token), 0600);
 }
 
 int main(int argc, char **argv)
@@ -1060,6 +1245,10 @@ int main(int argc, char **argv)
         return 1;
     }
     (void)lock_fd;  /* held until process exit; kernel releases the flock. */
+    if (ensure_control_token() != 0) {
+        fprintf(stderr, "agentd: control token: %s\n", strerror(errno));
+        return 1;
+    }
 
     if (setup_signals() != 0) {
         fprintf(stderr, "agentd: signals: %s\n", strerror(errno));
@@ -1134,6 +1323,7 @@ int main(int argc, char **argv)
 
         int timeout_ms = inotify_ok ? INOTIFY_SAFETY_SEC * 1000
                                     : RECONCILE_INTERVAL_SEC * 1000;
+        timeout_ms = scheduled_restart_timeout_ms(timeout_ms);
         int pr = poll(pfd, (nfds_t)npfd, timeout_ms);
         if (pr == -1) {
             if (errno == EINTR) continue;
@@ -1184,7 +1374,7 @@ int main(int argc, char **argv)
         /* Periodic reconcile:
          *   - no inotify  → on every wake (5s ticks)
          *   - with inotify → only when poll timed out (60s safety net) */
-        if (!inotify_ok || pr == 0) {
+        if (!inotify_ok || pr == 0 || scheduled_restart_due()) {
             scan_disk_agents(reconcile_cb_, NULL);
         }
     }

@@ -216,7 +216,7 @@ static int cgroup_setup_linux(const char *agent_name,
     }
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
         snprintf(st->reason, sizeof(st->reason),
-                 "mkdir %s: %s", dir, strerror(errno));
+                 "cgroup mkdir: %.220s", strerror(errno));
         st->cgroup_status = ENF_STATUS_UNAVAILABLE;
         return -1;
     }
@@ -322,6 +322,7 @@ static void add_write_cb_(const char *p, void *ud)
 }
 
 static int landlock_apply_linux(const char *agent_name,
+                                const char *runtime_path,
                                 const char *caps_text,
                                 enforcement_state_t *st)
 {
@@ -336,6 +337,7 @@ static int landlock_apply_linux(const char *agent_name,
 
     uint64_t read_mask  = LANDLOCK_ACCESS_FS_READ_FILE |
                           LANDLOCK_ACCESS_FS_READ_DIR;
+    uint64_t execute_mask = LANDLOCK_ACCESS_FS_EXECUTE;
     uint64_t write_mask = LANDLOCK_ACCESS_FS_WRITE_FILE |
                           LANDLOCK_ACCESS_FS_REMOVE_FILE |
                           LANDLOCK_ACCESS_FS_REMOVE_DIR |
@@ -349,7 +351,7 @@ static int landlock_apply_linux(const char *agent_name,
                           (abi >= 2 ? LANDLOCK_ACCESS_FS_REFER : 0);
 
     struct landlock_ruleset_attr attr = {0};
-    attr.handled_access_fs = read_mask | write_mask;
+    attr.handled_access_fs = read_mask | write_mask | execute_mask;
 
     int rsfd = sys_landlock_create_ruleset(&attr, sizeof(attr), 0);
     if (rsfd < 0) {
@@ -363,20 +365,38 @@ static int landlock_apply_linux(const char *agent_name,
 
     /* Default baseline reads: things any process needs to function. */
     static const char *default_reads[] = {
-        "/etc", "/usr", "/lib", "/lib64", "/proc", "/dev/null", "/dev/urandom",
+        "/etc", "/proc", "/dev/null", "/dev/urandom",
         NULL
     };
     for (int i = 0; default_reads[i]; i++) add_path_rule(&c, default_reads[i], read_mask);
-    /* Plus the data root so agents can read their own state tree
-     * (policy, profile, etc.). Resolved at runtime per the
-     * agentctl_root precedence (env / XDG / /tmp). */
-    add_path_rule(&c, agent_root(), read_mask);
-
-    /* Default writes: the agent's own runtime dir. */
-    char own_dir[MAX_PATHBUF];
-    if (agent_dir(own_dir, sizeof(own_dir), agent_name) == 0) {
-        add_path_rule(&c, own_dir, read_mask | write_mask);
+    static const char *default_runtime_dirs[] = {
+        "/usr", "/lib", "/lib64", NULL
+    };
+    for (int i = 0; default_runtime_dirs[i]; i++)
+        add_path_rule(&c, default_runtime_dirs[i], read_mask | execute_mask);
+    /* LANDLOCK_RULE_PATH_BENEATH execute grants are directory-anchored. Keep
+     * the implicit runtime grant to the executable's immediate directory. */
+    if (runtime_path && *runtime_path) {
+        char runtime_dir[MAX_PATHBUF];
+        snprintf(runtime_dir, sizeof(runtime_dir), "%s", runtime_path);
+        char *slash = strrchr(runtime_dir, '/');
+        if (slash) {
+            if (slash == runtime_dir) slash[1] = '\0';
+            else *slash = '\0';
+            add_path_rule(&c, runtime_dir, read_mask | execute_mask);
+        }
     }
+    /* Per-agent boundary: operator configuration is readable but never
+     * writable by the child. Application state lives under data/. Runtime
+     * status remains writable for the v1 status/audit API, but contains no
+     * policy or lifecycle inputs. Do not grant the shared agents/ tree. */
+    char config_dir[MAX_PATHBUF], runtime_dir[MAX_PATHBUF], data_dir[MAX_PATHBUF];
+    if (agent_config_dir(config_dir, sizeof(config_dir), agent_name) == 0)
+        add_path_rule(&c, config_dir, read_mask);
+    if (agent_runtime_dir(runtime_dir, sizeof(runtime_dir), agent_name) == 0)
+        add_path_rule(&c, runtime_dir, read_mask | write_mask);
+    if (agent_data_dir(data_dir, sizeof(data_dir), agent_name) == 0)
+        add_path_rule(&c, data_dir, read_mask | write_mask);
 
     /* Caps-driven extras. */
     iter_allow_with_verb(caps_text, "fs.read",  add_read_cb_,  &c);
@@ -403,10 +423,12 @@ static int landlock_apply_linux(const char *agent_name,
 }
 
 #else  /* !HAVE_LANDLOCK */
-static int landlock_apply_linux(const char *agent_name, const char *caps_text,
+static int landlock_apply_linux(const char *agent_name,
+                                const char *runtime_path,
+                                const char *caps_text,
                                 enforcement_state_t *st)
 {
-    (void)agent_name; (void)caps_text;
+    (void)agent_name; (void)runtime_path; (void)caps_text;
     st->landlock_status = ENF_STATUS_UNAVAILABLE;
     snprintf(st->reason, sizeof(st->reason),
              "kernel headers lack <linux/landlock.h>");
@@ -602,6 +624,7 @@ int enforcement_parent_attach_pid(const enforcement_state_t *state, pid_t pid)
 }
 
 int enforcement_child_apply(const char *agent_name,
+                             const char *runtime_path,
                              const enforcement_spec_t *spec,
                              enforcement_state_t *state)
 {
@@ -613,7 +636,9 @@ int enforcement_child_apply(const char *agent_name,
         (void)read_small_file(caps_path, caps_buf, sizeof(caps_buf), NULL);
 
     if (spec->fs_mode == ENFORCE_FS_LANDLOCK) {
-        (void)landlock_apply_linux(agent_name, caps_buf, state);
+        (void)landlock_apply_linux(
+            agent_name, runtime_path, caps_buf, state
+        );
     }
     /* Persist after landlock so the supervisor / inspect see the rule count. */
     (void)write_state_file(agent_name, state);
@@ -654,10 +679,11 @@ int enforcement_parent_attach_pid(const enforcement_state_t *state, pid_t pid)
 }
 
 int enforcement_child_apply(const char *agent_name,
+                             const char *runtime_path,
                              const enforcement_spec_t *spec,
                              enforcement_state_t *state)
 {
-    (void)spec;
+    (void)runtime_path; (void)spec;
     /* Same as parent_setup on non-Linux: nothing to do, just persist. */
     return write_state_file(agent_name, state);
 }

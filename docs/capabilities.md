@@ -31,6 +31,13 @@ poll loop watches every live broker fd; `POLLIN` triggers
 Construction is in `common.c::spawn_agent_runtime`; handler is in
 `agentd.c::broker_handle_event`.
 
+fd 3 is a shared request/response channel. Supervised runtimes also inherit
+an unlinked regular-file descriptor at fd 5. `ipc_connect` holds an in-process
+lock plus a POSIX record lock on fd 5 across the complete exchange. This
+prevents threads or forked descendants from consuming one another's
+`SCM_RIGHTS` response. Code bypassing `ipc_connect` must provide equivalent
+serialization.
+
 ## Wire format
 
 | Direction | Header bytes | Ancillary |
@@ -56,16 +63,16 @@ For the v1 cap `mailbox.send:<target>`:
    closed and an audit line is emitted.
 5. `broker_parse` validates the header; malformed → `denied:
    malformed-request`.
-6. agentd reads X's `/tmp/agents/X/policy` and extracts `allow
+6. agentd reads X's `<root>/agents/X/config/policy` and extracts `allow
    <pattern>` lines.
 7. `broker_policy_check` matches the requested cap name against the
    pattern list (exact or `<prefix>*` wildcard-suffix). Empty pattern
    list → deny.
-8. On allow: `broker_open_mailbox_send(target)` opens a
-   `SOCK_SEQPACKET` + `connect()`s to
-   `/tmp/agents/<target>/agent.sock`.
+8. On allow, agentd creates a fresh socketpair. It transfers the receiver end,
+   plus authenticated requester metadata, over the target's inherited fd 4
+   inbox channel.
 9. An 8-hex token is generated from `/dev/urandom`.
-10. agentd `sendmsg`s the `issued` response with the connected fd in
+10. agentd `sendmsg`s the `issued` response with the requester end in
     `SCM_RIGHTS`.
 11. agentd closes its own copy of the connected fd immediately.
 12. Both `agentd.log` and X's `audit.log` record the issuance with
@@ -96,7 +103,7 @@ field. Current reasons:
 
 - `malformed-request` — broker_parse failed
 - `not-in-caps` — cap name didn't match any allow pattern
-- `no-listener` — target's `agent.sock` didn't accept the connect
+- `no-listener` — target has no live inherited inbox channel
 - `unknown-cap-kind` — request matched policy but isn't a cap kind
   the v1 broker knows how to issue
 - `<errno-string>` — kernel-level failure during issuance
@@ -148,21 +155,14 @@ ba (requester)        agentd                bb (target)
   │                     │                       │
   │  send via issued fd ───────────────────────►│
   │                     │                       │   bb receives the
-  │                     │                       │   message; peer creds
-  │                     │                       │   on the fd still show
-  │                     │                       │   agentd.
+  │                     │                       │   message with requester
+  │                     │                       │   identity authenticated
+  │                     │                       │   by inbox metadata.
 ```
 
-This is documented and intentional. The broker is the connector, so
-the connector's creds are agentd's. Receivers that want the
-requester's identity must read the `REPLY-TO` header — which is a
-**userspace claim, not kernel-authenticated**. If you need
-kernel-authenticated requester identity at the target, the v1
-broker does not provide it. A "broker-proxied" cap (where agentd
-sits between sender and receiver, forwarding messages) would give
-the target a meaningful `SO_PEERCRED` (agentd's) but still not the
-requester's. Per-agent uids + cross-agent kernel-verified creds
-would solve it; not built.
+Receivers use the metadata delivered by agentd with the fd for requester
+identity. `REPLY-TO` remains an unauthenticated routing claim and must not
+override `peer_id_t.authenticated_name` for authorization.
 
 ### Confused deputy
 
@@ -174,7 +174,7 @@ operationalized in v1:
 | Process X requests a cap it shouldn't have | Policy gate (default-deny) + audit |
 | Process X attempts to make the broker do work on a third party's behalf | Broker reads only X's policy; per-channel kernel-verified identity ensures the broker can't be tricked about who is asking |
 | Operator runs `agentctl grant X <cap>` while X manipulates the operator's environment | Out of scope; the CLI runs as the operator |
-| Process X sends `REPLY-TO ba` while not being ba | Receiver can choose to trust the header or not; audit log is the authoritative source of who-asked-for-what |
+| Process X sends `REPLY-TO ba` while not being ba | Receiver authorizes against broker-authenticated peer metadata, not the header |
 
 ### Why `REPLY-TO` is not kernel-authenticated identity
 
@@ -191,18 +191,12 @@ Authorization decisions on the receiver side should not be made on
 authorization (sender's possession of the fd is sufficient), or
 they consult the audit log. There is no third option.
 
-### Same-uid bypass of the broker
+### Same-uid limitation
 
-Same-uid processes can `socket() + connect()` directly to any
-peer's `agent.sock` without going through the broker. Filesystem
-permissions on the socket path (mode 0600 owned by the operator)
-do not prevent same-uid bypass.
-
-This means: **the broker is the canonical issuance path, but not
-the only way two same-uid processes can communicate.** In the v1
-threat model (trusted-tenant), this is acceptable: operators are
-expected to trust that all processes running under the supervisor's
-uid are within the same trust domain. If that assumption breaks,
+Daemon-supervised agents expose no pathname mailbox: application channels are
+socketpairs minted by agentd. A same-UID adversary may still use `ptrace`,
+`/proc`, signals, or fd forwarding to cross the boundary. If that assumption
+breaks,
 escalate to per-agent uids or namespaces.
 
 ### Revocation

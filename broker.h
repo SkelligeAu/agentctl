@@ -62,18 +62,14 @@ int broker_format_issued(char *buf, size_t cap_sz,
 int broker_format_denied(char *buf, size_t cap_sz,
                          const char *cap, const char *reason);
 
-/* Generate an 8-char hex token (32 bits from /dev/urandom). */
-void broker_make_token(char out[BROKER_TOKEN_LEN + 1]);
+/* Generate an 8-char hex token (32 bits from /dev/urandom). Fails closed if
+ * the entropy source cannot provide all bytes. */
+int broker_make_token(char out[BROKER_TOKEN_LEN + 1]);
 
 /* Test whether `cap_name` is permitted by `allow_patterns[]`. Each pattern
  * is exact or wildcard-suffix (e.g. "mailbox.send:*"). Returns 1 if allowed. */
 int broker_policy_check(const char *cap_name,
                         const char *const *allow_patterns,
                         int n_patterns);
-
-/* Issue mailbox.send:<target>: open a SOCK_SEQPACKET, connect to target's
- * <root>/agents/<target>/agent.sock, return the connected fd ready for SCM_RIGHTS.
- * Returns fd >= 0, -1 on local error, -2 if target has no listener. */
-int broker_open_mailbox_send(const char *target);
 
 #endif

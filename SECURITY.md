@@ -21,6 +21,11 @@ where mutually distrustful workloads share a host.
 | A supervised process attempts to acquire authority outside its policy | Broker denies; default-deny; one cap = one fd |
 | The host operator wants to inspect what authority a process holds at a given moment | `/proc/<pid>/fd/` + agentd audit log + per-agent `audit.log` correlated by 8-hex token |
 
+Crash restart is bounded: short-lived failures use exponential backoff and
+the fifth consecutive short run is suppressed as `crash-loop`. An explicit
+operator start clears suppression. This prevents a broken runtime from
+turning the single-threaded supervisor into a permanent restart loop.
+
 ### Out of scope
 
 | Threat | Why |
@@ -42,8 +47,9 @@ The Trusted Computing Base for an agentctl deployment is:
    `sendmsg`/`recvmsg` with `SCM_RIGHTS`, `pidfd_open`,
    `pidfd_send_signal`, `landlock_*`, `seccomp`, cgroup v2 ops.
 2. **`agentd`** — the supervisor process. **agentd is the trust root.**
-   It holds all pidfds, all broker socketpair endpoints, all issued-cap
-   sentinel handles. Compromise of agentd is equivalent to compromise
+   It holds all pidfds, broker endpoints, and receiver inbox-delivery
+   endpoints. It retains no endpoint for an issued application channel.
+   Compromise of agentd is equivalent to compromise
    of every process it supervises.
 3. **`agentctl`** — runs in the operator's session under the operator's
    uid. Compromise of `agentctl` is equivalent to operator compromise.
@@ -60,9 +66,9 @@ your threat model.
 |---|---|
 | Message payloads received over `SOCK_SEQPACKET` (or the macOS STREAM fallback) | Opaque bytes; the engine does not parse them. Application code parses; transport drops malformed frames + closes the connection. |
 | `MSG_TRUNC` / `MSG_CTRUNC` from a peer | Protocol violation; receiver closes the connection. Fatal at the connection level, never at the engine level. |
-| Filenames in artifact-write paths | Application must validate (no `/`, no `..`). The engine does not. |
-| Broker request bytes from a supervised process | Parsed by `broker_parse`; malformed requests denied with a logged audit line. |
-| The contents of `/tmp/agents/<name>/policy` | **Privileged input.** The operator (via `agentctl grant`/`deny`) is the only authorized writer. If a supervised process can write to its own policy file, the broker's policy gate is bypassed. Default permissions are 0600 owned by the operator's uid. |
+| Task ids and filenames in task/artifact paths | Centrally validated as single path components; traversal, hidden components, and oversized names are rejected. |
+| Broker request bytes from a supervised process | Parsed by `broker_parse`; missing required fields, duplicates, oversized fields, and malformed requests are denied with a logged audit line. |
+| The contents of `<root>/agents/<name>/config/policy` | **Privileged input.** The operator (via `agentctl grant`/`deny`) is the only authorized writer. Linux Landlock profiles grant the child read-only access to `config/`; writable application state is confined to `data/`. |
 
 ## What the kernel enforces
 
@@ -86,6 +92,13 @@ Things agentctl does not enforce, and that operators must NOT assume:
   files (subject to file permissions), and observe each other in
   `ps`. If you need cross-process isolation as a security boundary,
   add user namespaces or per-agent uids — neither is built today.
+
+- **Control-socket authentication is filesystem-isolation dependent.** CLI
+  commands carry a random token stored at `<root>/agentd.token`, outside the
+  agent's Landlock-visible directories. This protects against accidental or
+  hostile-input-driven control attempts by a normally confined child. It is
+  not protection from a same-UID adversary able to bypass Landlock or inspect
+  the operator process.
 
 - **Network egress.** Profiles do not block network access by default.
   A profile may seccomp-deny `socket(AF_INET, ...)` if the operator
@@ -118,25 +131,16 @@ means an attacker who compromises any one supervised process gains:
 - The ability to `kill(-1, sig)` other supervised processes.
 - Read access to other agent dirs under `/tmp/agents/` (mode 0700, but
   same uid bypasses).
-- The ability to connect directly to any agent's `agent.sock`
-  (filesystem permissions only).
+- The ability to inspect or manipulate another process with same-UID tools
+  such as `ptrace`; this can expose inherited capability descriptors.
 
-The broker is a logical gate, not a kernel-enforced one. A
-compromised supervised process can still `socket() + connect()` to
-any peer's `agent.sock` directly, bypassing the broker — because the
-listener socket is in the filesystem and accepts same-uid clients.
-
-To make the broker the *only* path to issuance:
-
-1. Per-agent uids (not built; requires `CAP_SETUID` or
-   user-namespace mapping in agentd).
-2. Per-agent mount namespaces hiding peer sockets (not built).
-3. Or: physically removing peer sockets from the filesystem and using
-   only broker-issued connected fds (the "pre-connected pair" model
-   in the capability design doc; not built).
-
-Until one of these lands, **the broker provides authoritative audit
-and policy gating, not kernel-enforced peer isolation.**
+Daemon-supervised agents do not expose pathname mailboxes. `agentd` creates a
+fresh socketpair for every allowed issuance and transfers one end to each
+agent over inherited private channels. This removes the former direct
+`agent.sock` bypass. It does not create adversarial same-UID isolation:
+`ptrace`, `/proc`, signals, and descriptor forwarding remain out of scope.
+Direct-mode agents, which have no daemon broker, retain legacy pathname
+mailboxes and are explicitly cooperative-only.
 
 ## `SO_PEERCRED` semantics — and how the broker subverts them
 
@@ -151,11 +155,10 @@ Subtleties operators must understand:
   reuses A's fd. B's `SO_PEERCRED` still reports A's original pid.
   Authority is the fd's, not the current sender's getpid().
 
-- **Broker-issued sockets report agentd's pid, not the requester's.**
-  When `ba` requests `mailbox.send:bb`, agentd performs the
-  `connect()` to bb's listener. bb's accept side reads
-  `SO_PEERCRED` and sees `agentd`. The requester's identity must be
-  carried by the application's `REPLY-TO` header.
+- **Broker-issued socketpairs have no meaningful connector credential.**
+  The broker delivers authenticated requester name, pid, and uid alongside
+  the receiver fd on its private inbox channel. libagentctl exposes that name
+  as `peer_id_t.authenticated_name`.
 
 - **`REPLY-TO` is not kernel-authenticated.** Any process holding a
   send fd can put any string in the `REPLY-TO` header. The broker's
@@ -170,7 +173,7 @@ Be honest about what Unix supports:
 
 | Cap class | Revocation behavior |
 |---|---|
-| Socket-anchored caps (e.g., `mailbox.send`) | Broker closes its sentinel/connection-source → receiver's send returns `EPIPE` on next call. **Real, prompt.** |
+| Socket-anchored caps (e.g., `mailbox.send`) | agentd retains no per-issuance fd after transfer. A delivered fd cannot be revoked; restart the holder for finality. |
 | `pidfd` for peer observation | Auto-revokes when the target process exits. **Lifecycle-anchored.** |
 | Filesystem caps (when added) | Existing fds keep working until the holder closes them; unlinking the path does not invalidate open fds. **Eventual at best; restart the holder for finality.** |
 | Any fd already delivered into a holder's fd table | Receiver controls; broker has no kernel-level mechanism to revoke. **Restart the holder is the only sure revocation.** |

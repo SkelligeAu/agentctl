@@ -27,6 +27,44 @@
 #  include <sys/ucred.h>
 #endif
 
+/* fd 3 is shared by every thread and forked descendant of a supervised
+ * runtime. A process-local guard serializes threads; the inherited regular
+ * fd 5 supplies a POSIX record lock that serializes distinct processes. */
+static volatile int g_broker_thread_lock = 0;
+
+static int broker_exchange_lock(void)
+{
+    const char *marker = getenv("AGENTCTL_BROKER_LOCK_FD");
+    if (!marker || strcmp(marker, "5") != 0 ||
+        fcntl(BROKER_LOCK_FD_SLOT, F_GETFD) < 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    while (__sync_lock_test_and_set(&g_broker_thread_lock, 1)) {
+        struct timespec ts = { 0, 1000L * 1000L };
+        nanosleep(&ts, NULL);
+    }
+    struct flock lk;
+    memset(&lk, 0, sizeof(lk));
+    lk.l_type = F_WRLCK;
+    lk.l_whence = SEEK_SET;
+    int rc;
+    do { rc = fcntl(BROKER_LOCK_FD_SLOT, F_SETLKW, &lk); }
+    while (rc < 0 && errno == EINTR);
+    if (rc < 0) __sync_lock_release(&g_broker_thread_lock);
+    return rc;
+}
+
+static void broker_exchange_unlock(void)
+{
+    struct flock lk;
+    memset(&lk, 0, sizeof(lk));
+    lk.l_type = F_UNLCK;
+    lk.l_whence = SEEK_SET;
+    (void)fcntl(BROKER_LOCK_FD_SLOT, F_SETLK, &lk);
+    __sync_lock_release(&g_broker_thread_lock);
+}
+
 /* Per-platform socket type. */
 #if defined(__linux__)
 #  define IPC_SOCK_TYPE SOCK_SEQPACKET
@@ -67,9 +105,7 @@ static int set_nonblock(int fd)
 
 static int sock_path_for(const char *agent_name, char *out, size_t n)
 {
-    int r = snprintf(out, n, "%s/%s/agent.sock", AGENT_ROOT, agent_name);
-    if (r < 0 || (size_t)r >= n) { errno = ENAMETOOLONG; return -1; }
-    return 0;
+    return agent_path(out, n, agent_name, "agent.sock");
 }
 
 /* ----------------------------------------------------------------
@@ -78,6 +114,11 @@ static int sock_path_for(const char *agent_name, char *out, size_t n)
 
 int ipc_listen(const char *agent_name)
 {
+    /* agentd-supervised runtimes receive a private capability-delivery
+     * channel at fd 4. No pathname mailbox is created in that mode. */
+    const char *inherited = getenv("AGENTCTL_INBOX_FD");
+    if (inherited && strcmp(inherited, "4") == 0 &&
+        fcntl(INBOX_FD_SLOT, F_GETFD) != -1) return INBOX_FD_SLOT;
     char path[MAX_PATHBUF];
     if (sock_path_for(agent_name, path, sizeof(path)) != 0) return -1;
     (void)unlink(path);
@@ -90,7 +131,9 @@ int ipc_listen(const char *agent_name)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof(a.sun_path)) { close(fd); errno = ENAMETOOLONG; return -1; }
+    memcpy(a.sun_path, path, path_len + 1);
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
         int e = errno; close(fd); errno = e; return -1;
     }
@@ -138,6 +181,49 @@ static int read_peer_creds(int fd, peer_id_t *out)
 
 int ipc_accept(int server_fd, peer_id_t *out_peer)
 {
+    if (server_fd == INBOX_FD_SLOT) {
+        char meta[256];
+        char control[CMSG_SPACE(sizeof(int))];
+        struct iovec iov = { .iov_base = meta, .iov_len = sizeof(meta) - 1 };
+        struct msghdr mh;
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_iov = &iov; mh.msg_iovlen = 1;
+        mh.msg_control = control; mh.msg_controllen = sizeof(control);
+        ssize_t n;
+        do { n = recvmsg(server_fd, &mh, MSG_CMSG_CLOEXEC); } while (n < 0 && errno == EINTR);
+        if (n <= 0 || (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+            /* EOF on the inherited delivery channel means agentd is gone.
+             * Convert it to the normal runtime shutdown signal so callers do
+             * not spin forever polling a permanently readable EOF. */
+            if (n == 0) {
+                shutdown_flag = 1;
+                errno = EINTR;
+            }
+            else if (n > 0) errno = EPROTO;
+            return -1;
+        }
+        int issued = -1;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                memcpy(&issued, CMSG_DATA(c), sizeof(issued)); break;
+            }
+        if (issued < 0) { errno = EPROTO; return -1; }
+        set_cloexec(issued);
+        meta[n] = '\0';
+        if (out_peer) {
+            memset(out_peer, 0, sizeof(*out_peer));
+            char sender[MAX_NAME] = "";
+            long pid = 0, uid = 0;
+            (void)sscanf(meta, "SENDER %63s\nPID %ld\nUID %ld", sender, &pid, &uid);
+            snprintf(out_peer->authenticated_name,
+                     sizeof(out_peer->authenticated_name), "%s", sender);
+            out_peer->pid = (pid_t)pid;
+            out_peer->uid = (uid_t)uid;
+        }
+        struct timeval tv = { 30, 0 };
+        (void)setsockopt(issued, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        return issued;
+    }
     int cfd;
     do {
         cfd = accept(server_fd, NULL, NULL);
@@ -153,6 +239,45 @@ int ipc_accept(int server_fd, peer_id_t *out_peer)
 
 int ipc_connect(const char *target)
 {
+    /* Supervised runtimes never know a mailbox pathname. Acquire a fresh
+     * connected capability through their inherited broker channel. */
+    int broker_type = 0; socklen_t broker_type_len = sizeof(broker_type);
+    if (fcntl(BROKER_FD_SLOT, F_GETFD) != -1 &&
+        getsockopt(BROKER_FD_SLOT, SOL_SOCKET, SO_TYPE,
+                   &broker_type, &broker_type_len) == 0) {
+        if (validate_name(target) != 0) { errno = EINVAL; return IPC_ERR; }
+        if (broker_exchange_lock() != 0) return IPC_ERR;
+        char req[256];
+        int rn = snprintf(req, sizeof(req),
+                          "VERB request\nCAP mailbox.send:%s\nREASON libagentctl\n\n",
+                          target);
+        if (rn <= 0 || send(BROKER_FD_SLOT, req, (size_t)rn, 0) < 0) {
+            broker_exchange_unlock();
+            return IPC_ERR;
+        }
+        char resp[512], control[CMSG_SPACE(sizeof(int))];
+        struct iovec iov = { .iov_base = resp, .iov_len = sizeof(resp) };
+        struct msghdr mh;
+        memset(&mh, 0, sizeof(mh)); mh.msg_iov = &iov; mh.msg_iovlen = 1;
+        mh.msg_control = control; mh.msg_controllen = sizeof(control);
+        ssize_t got;
+        do { got = recvmsg(BROKER_FD_SLOT, &mh, MSG_CMSG_CLOEXEC); }
+        while (got < 0 && errno == EINTR);
+        if (got <= 0) { broker_exchange_unlock(); return IPC_ERR; }
+        int issued = -1;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                memcpy(&issued, CMSG_DATA(c), sizeof(issued)); break;
+            }
+        if (issued < 0) {
+            broker_exchange_unlock();
+            errno = EACCES;
+            return IPC_ERR;
+        }
+        set_cloexec(issued);
+        broker_exchange_unlock();
+        return issued;
+    }
     char path[MAX_PATHBUF];
     if (sock_path_for(target, path, sizeof(path)) != 0) return IPC_ERR;
     int fd = socket(AF_UNIX, IPC_SOCK_TYPE | SOCK_CLOEXEC, 0);
@@ -162,7 +287,9 @@ int ipc_connect(const char *target)
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof(a.sun_path)) { close(fd); errno = ENAMETOOLONG; return -1; }
+    memcpy(a.sun_path, path, path_len + 1);
     if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
         int e = errno; close(fd);
         if (e == ENOENT || e == ECONNREFUSED) return IPC_PEER_GONE;
@@ -176,7 +303,7 @@ int ipc_connect(const char *target)
 void ipc_close_listener(int server_fd, const char *agent_name)
 {
     if (server_fd >= 0) close(server_fd);
-    if (agent_name) {
+    if (agent_name && server_fd != INBOX_FD_SLOT) {
         char path[MAX_PATHBUF];
         if (sock_path_for(agent_name, path, sizeof(path)) == 0)
             (void)unlink(path);
@@ -367,6 +494,9 @@ static int parse_inplace(char *buf, size_t total_len, ipc_msg_t *out)
     out->payload_len = 0;
 
     size_t explicit_len = (size_t)-1;
+    unsigned seen = 0;
+    enum { SEEN_VERB = 1u, SEEN_LEN = 2u, SEEN_REPLY = 4u,
+           SEEN_TASK = 8u };
     char *p = buf;
     char *end = buf + header_len;
     while (p < end) {
@@ -375,25 +505,34 @@ static int parse_inplace(char *buf, size_t total_len, ipc_msg_t *out)
         *eol = '\0';
         size_t llen = (size_t)(eol - p);
         if (llen >= 5 && memcmp(p, "VERB ", 5) == 0) {
+            if (seen & SEEN_VERB) return -1;
             const char *v = p + 5;
             while (*v == ' ') v++;
             if (!*v) return -1;
             out->verb = v;
+            seen |= SEEN_VERB;
         } else if (llen >= 4 && memcmp(p, "LEN ", 4) == 0) {
+            if (seen & SEEN_LEN) return -1;
             const char *v = p + 4;
             while (*v == ' ') v++;
             char *endp; errno = 0;
             long n = strtol(v, &endp, 10);
-            if (errno != 0 || n < 0 || (size_t)n > IPC_MSG_HARD_CAP) return -1;
+            if (errno != 0 || endp == v || *endp != '\0' || n < 0 ||
+                (size_t)n > IPC_MSG_HARD_CAP) return -1;
             explicit_len = (size_t)n;
+            seen |= SEEN_LEN;
         } else if (llen >= 9 && memcmp(p, "REPLY-TO ", 9) == 0) {
+            if (seen & SEEN_REPLY) return -1;
             const char *v = p + 9;
             while (*v == ' ') v++;
             out->reply_to = v;
+            seen |= SEEN_REPLY;
         } else if (llen >= 8 && memcmp(p, "TASK-ID ", 8) == 0) {
+            if (seen & SEEN_TASK) return -1;
             const char *v = p + 8;
             while (*v == ' ') v++;
             out->task_id = v;
+            seen |= SEEN_TASK;
         }
         /* Unknown headers ignored — forward-compat. */
         p = eol + 1;
@@ -409,6 +548,13 @@ static int parse_inplace(char *buf, size_t total_len, ipc_msg_t *out)
     if (out->payload_len > 0) out->payload = payload_start;
     return 0;
 }
+
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+int ipc_parse_for_fuzz(char *buf, size_t len, ipc_msg_t *out_msg)
+{
+    return parse_inplace(buf, len, out_msg);
+}
+#endif
 
 #if defined(__APPLE__)
 /* macOS STREAM: read header byte-by-byte until blank line, parse LEN, read
@@ -442,7 +588,8 @@ static int recv_stream_into(int fd, char *buf, size_t bufcap, size_t *out_total)
             nb[k] = '\0';
             char *endp; errno = 0;
             long n = strtol(nb, &endp, 10);
-            if (errno != 0 || n < 0 || (size_t)n > IPC_MSG_HARD_CAP) return IPC_PROTO_VIOLATION;
+            if (errno != 0 || endp == nb || *endp != '\0' || n < 0 ||
+                (size_t)n > IPC_MSG_HARD_CAP) return IPC_PROTO_VIOLATION;
             need = (size_t)n;
             break;
         }
