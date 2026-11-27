@@ -92,3 +92,5 @@ agentd.log
 audit.log
 
 tests/test_broker_timeout
+
+tests/test_service_supervisor

@@ -645,6 +645,10 @@ static int seccomp_apply_linux(enforcement_state_t *st)
 
         /* Random. */
         SC_ALLOW(__NR_getrandom),
+#ifdef __NR_memfd_create
+        /* Anonymous sealed input; confers no path access. */
+        SC_ALLOW(__NR_memfd_create),
+#endif
 
         /* Default: return EPERM so the caller observes a clean errno and
          * can audit. KILL would be louder but harder to debug. */

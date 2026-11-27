@@ -432,6 +432,16 @@ static int cmd_start(const char *name, const char *runtime_path,
         return 0;
     }
 
+    char policy[32], critical[16];
+    int is_service = read_agent_setting(name, "restart_policy", policy, sizeof(policy)) == 0 &&
+                     strcmp(policy, "service") == 0;
+    int is_critical = read_agent_setting(name, "critical", critical, sizeof(critical)) == 0 &&
+                      strcmp(critical, "yes") == 0;
+    if (is_service || is_critical) {
+        write_agent_setting(name, "desired_state", "stopped");
+        fprintf(stderr, "service or critical policy requires agentd\n");
+        return 1;
+    }
     /* No daemon — run the supervisor inline. No broker in direct mode
      * (there's no long-lived supervisor process to mediate fd transfers). */
     pid_t pid = 0;
@@ -467,8 +477,8 @@ static int cmd_set_restart_policy(const char *name, const char *policy)
         fprintf(stderr, "set-restart-policy: invalid name\n"); return 1;
     }
     if (strcmp(policy, "never") != 0 && strcmp(policy, "on-failure") != 0 &&
-        strcmp(policy, "always") != 0) {
-        fprintf(stderr, "set-restart-policy: expected never|on-failure|always\n");
+        strcmp(policy, "always") != 0 && strcmp(policy, "service") != 0) {
+        fprintf(stderr, "set-restart-policy: expected never|on-failure|always|service\n");
         return 1;
     }
     if (write_agent_setting(name, "restart_policy", policy) != 0) {
@@ -1471,7 +1481,7 @@ static void usage(void)
         "  restart       <name>                (via agentd; same fork lineage)\n"
         "  enable        <name>                (agentd will keep it running)\n"
         "  disable       <name>                (agentd will stop it)\n"
-        "  set-restart-policy <name> <p>       (never|on-failure|always)\n"
+        "  set-restart-policy <name> <p>       (never|on-failure|always|service)\n"
         "  daemon-shutdown                     (tell agentd to exit)\n",
         stderr);
 }

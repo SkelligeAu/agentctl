@@ -173,3 +173,6 @@ It is not a supported production transport.
 - [Multiple-user deployment](docs/multi-tenant.md)
 - [macOS development](docs/macos.md)
 - [Benchmarks](BENCHMARKS.md)
+
+For single-use workers with fresh-process rearming and a supervisor timeout, see
+[Bounded service workers](docs/bounded-service-workers.md).

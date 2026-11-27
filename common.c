@@ -266,7 +266,7 @@ static const char *leaf_class(const char *leaf)
     static const char *const config_leaves[] = {
         "goal", "policy", "limits", "profile", "config", "exec", "runtime",
         "desired_state", "enabled", "restart_policy", "transport",
-        "enforcement.overrides", NULL
+        "enforcement.overrides", "service_timeout_ms", "service_request_timeout_ms", "critical", NULL
     };
     static const char *const runtime_leaves[] = {
         "pid", "status", "supervisor", "restart_count",
@@ -1196,6 +1196,20 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
                         pid_t *out_pid, int *out_broker_fd, int *out_inbox_fd,
                         int *out_cgroup_kill_fd)
 {
+    return spawn_agent_runtime_service(name, runtime_path, supervisor_label,
+        fs_override, sc_override, cg_override, out_pid, out_broker_fd,
+        out_inbox_fd, out_cgroup_kill_fd, NULL);
+}
+
+/* A non-NULL events output requests the strict service boundary. */
+int spawn_agent_runtime_service(const char *name, const char *runtime_path,
+                        const char *supervisor_label,
+                        int fs_override, int sc_override, int cg_override,
+                        pid_t *out_pid, int *out_broker_fd, int *out_inbox_fd,
+                        int *out_cgroup_kill_fd, int *out_cgroup_events_fd)
+{
+    int strict = out_cgroup_events_fd != NULL;
+    if (out_cgroup_events_fd) *out_cgroup_events_fd = -1;
     if (out_cgroup_kill_fd) *out_cgroup_kill_fd = -1;
     if (out_broker_fd) *out_broker_fd = -1;
     if (out_inbox_fd) *out_inbox_fd = -1;
@@ -1254,9 +1268,10 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
     int setup_rc = enforcement_parent_setup(name, &spec, &enf);
     /* No explicit limits retains the documented opportunistic cgroup
      * fallback. Configured limits must never silently become unlimited. */
-    if (setup_rc != 0 && (enf.cgroup_status != ENF_STATUS_UNAVAILABLE ||
-            spec.cg_memory_max > 0 || spec.cg_pids_max > 0 || spec.cg_cpu_max[0])) {
-        int saved = errno;
+    if ((strict && enf.cgroup_status != ENF_STATUS_ACTIVE) ||
+        (setup_rc != 0 && (enf.cgroup_status != ENF_STATUS_UNAVAILABLE ||
+            spec.cg_memory_max > 0 || spec.cg_pids_max > 0 || spec.cg_cpu_max[0]))) {
+        int saved = errno ? errno : ENOTSUP;
         audit_log(name, "cgroup setup failed: %s", enf.reason);
         if (audit_fd >= 0) close(audit_fd);
         write_status(name, "failed");
@@ -1357,11 +1372,21 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
         close(startup[0]); close(startup[1]);
         goto setup_failed;
     }
+    int cgroup_events_fd = strict ? lifecycle_cgroup_events_open(enf.cgroup_path) : -1;
+    if (strict && (cgroup_events_fd < 0 || lifecycle_cgroup_empty(cgroup_events_fd) != 1)) {
+        if (cgroup_events_fd >= 0) close(cgroup_events_fd);
+        if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
+        close(startup[0]); close(startup[1]);
+        /* Existing subtree state cannot be proved empty. The outer service
+         * must discard the boundary; never keep ingress alive on its own. */
+        _exit(70);
+    }
     /* Child cannot execute or fork until attachment succeeds. Parent death
      * closes the gate and makes the child fail before runtime execution. */
     int gate[2];
     if (pipe(gate) != 0) {
         close(startup[0]); close(startup[1]);
+        if (cgroup_events_fd >= 0) close(cgroup_events_fd);
         if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
         goto setup_failed;
     }
@@ -1374,6 +1399,7 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
         if (broker_lock_fd >= 0) close(broker_lock_fd);
         close(startup[0]); close(startup[1]);
         close(gate[0]); close(gate[1]);
+        if (cgroup_events_fd >= 0) close(cgroup_events_fd);
         if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
         errno = saved;
         return -1;
@@ -1387,6 +1413,7 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
             errno = ECANCELED; startup_failure(startup[1]);
         }
         close(gate[0]);
+        if (cgroup_events_fd >= 0) close(cgroup_events_fd);
         if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
         if (setsid() == -1) startup_failure(startup[1]);
         if (chdir(data_dir) == -1) startup_failure(startup[1]);
@@ -1487,7 +1514,7 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
 
     /* Wait briefly for status to flip off "starting". */
     char status_path[MAX_PATHBUF];
-    if (agent_path(status_path, sizeof(status_path), name, "status") == 0) {
+    if (!strict && agent_path(status_path, sizeof(status_path), name, "status") == 0) {
         for (int i = 0; i < 40; i++) {
             char sbuf[64];
             if (read_small_file(status_path, sbuf, sizeof(sbuf), NULL) == 0) {
@@ -1502,6 +1529,7 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
         }
     }
 
+    if (out_cgroup_events_fd) *out_cgroup_events_fd = cgroup_events_fd;
     if (out_pid) *out_pid = pid;
     if (out_cgroup_kill_fd) *out_cgroup_kill_fd = cgroup_kill_fd;
     else if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
@@ -1509,12 +1537,15 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
 child_failed:
     {
         int saved = errno;
+        if (strict && lifecycle_cgroup_kill_wait(cgroup_kill_fd, cgroup_events_fd, 2000) != 0)
+            _exit(70); /* Parent supervisor cannot prove boundary cleanup. */
         if (cgroup_kill_fd >= 0) (void)write_all(cgroup_kill_fd, "1\n", 2);
         (void)kill(pid, SIGKILL);
         (void)lifecycle_signal_group(pid, SIGKILL);
         while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
         if (out_broker_fd && *out_broker_fd >= 0) { close(*out_broker_fd); *out_broker_fd = -1; }
         if (out_inbox_fd && *out_inbox_fd >= 0) { close(*out_inbox_fd); *out_inbox_fd = -1; }
+        if (cgroup_events_fd >= 0) close(cgroup_events_fd);
         if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
         write_status(name, "failed");
         errno = saved;
@@ -1619,7 +1650,7 @@ int lifecycle_signal_group(pid_t pgid, int sig)
     return killpg(pgid, sig);
 }
 
-int lifecycle_cgroup_open(const char *cgroup_path)
+static int cgroup_open_leaf(const char *cgroup_path, const char *leaf, int flags)
 {
 #if defined(__linux__)
     if (!cgroup_path || !*cgroup_path) { errno = EINVAL; return -1; }
@@ -1629,14 +1660,54 @@ int lifecycle_cgroup_open(const char *cgroup_path)
     if (fstatfs(dir, &fs) != 0 || fs.f_type != CGROUP2_SUPER_MAGIC) {
         close(dir); errno = EINVAL; return -1;
     }
-    int fd = openat(dir, "cgroup.kill", O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    int fd = openat(dir, leaf, flags | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     int saved = errno; close(dir); errno = saved;
     return fd;
 #else
-    (void)cgroup_path;
+    (void)cgroup_path; (void)leaf; (void)flags;
     errno = ENOSYS;
     return -1;
 #endif
+}
+
+int lifecycle_cgroup_open(const char *path)
+{
+    return cgroup_open_leaf(path, "cgroup.kill", O_WRONLY);
+}
+
+int lifecycle_cgroup_events_open(const char *path)
+{
+    return cgroup_open_leaf(path, "cgroup.events", O_RDONLY);
+}
+
+int lifecycle_cgroup_empty(int fd)
+{
+    char buf[256];
+    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    if (!strncmp(buf, "populated 0\n", 12) || strstr(buf, "\npopulated 0\n")) return 1;
+    if (!strncmp(buf, "populated 1\n", 12) || strstr(buf, "\npopulated 1\n")) return 0;
+    errno = EIO;
+    return -1;
+}
+
+int lifecycle_cgroup_kill_wait(int kill_fd, int events_fd, int timeout_ms)
+{
+    if (kill_fd < 0 || events_fd < 0 || write(kill_fd, "1\n", 2) != 2) return -1;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    long long end = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + timeout_ms;
+    for (;;) {
+        int empty = lifecycle_cgroup_empty(events_fd);
+        if (empty == 1) return 0;
+        if (empty < 0 || clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+        if ((long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 >= end) {
+            errno = ETIMEDOUT; return -1;
+        }
+        struct timespec pause = {0, 10000000};
+        nanosleep(&pause, NULL);
+    }
 }
 
 int lifecycle_cgroup_kill(const char *cgroup_path)

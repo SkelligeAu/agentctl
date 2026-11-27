@@ -8,6 +8,9 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 static void marker(const char *name, const char *value)
 {
@@ -44,7 +47,24 @@ int main(int argc, char **argv)
     FILE *f = fopen("mode", "r");
     if (f) { (void)fscanf(f, "%31s", mode); fclose(f); }
     write_status(argv[1], "idle");
-    if (!strcmp(mode, "security-file-grant")) {
+    if (!strcmp(mode, "service-clean")) {
+        f = fopen("completions", "a");
+        if (!f) return 3;
+        fprintf(f, "%ld\n", (long)getpid());
+        fclose(f);
+        return 0;
+    } else if (!strcmp(mode, "service-memfd")) {
+#ifdef __linux__
+        int fd = memfd_create("sealed-input", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (fd < 0 || write(fd, "test", 4) != 4 ||
+            fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0)
+            return 3;
+        close(fd);
+        marker("memfd-ready", "sealed");
+#else
+        return 3;
+#endif
+    } else if (!strcmp(mode, "security-file-grant")) {
         char path[MAX_PATHBUF];
         int fd = open("/dev/null", O_WRONLY);
         if (fd < 0 || write(fd, "x", 1) != 1) return 4;

@@ -262,6 +262,17 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
                         pid_t *out_pid, int *out_broker_fd, int *out_inbox_fd,
                         int *out_cgroup_kill_fd);
 
+/* Strict service spawn requires an active, empty cgroup and returns both
+ * parent-owned handles. Caller closes them. */
+int spawn_agent_runtime_service(const char *name, const char *runtime_path,
+                        const char *supervisor_label,
+                        int fs_override, int sc_override, int cg_override,
+                        pid_t *out_pid, int *out_broker_fd, int *out_inbox_fd,
+                        int *out_cgroup_kill_fd, int *out_cgroup_events_fd);
+int lifecycle_cgroup_kill_wait(int kill_fd, int events_fd, int timeout_ms);
+int lifecycle_cgroup_events_open(const char *path);
+int lifecycle_cgroup_empty(int fd); /* 1 empty, 0 populated, -1 invalid/error */
+
 /* Misc */
 int refuse_root(void);
 int run_alive(pid_t pid);

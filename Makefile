@@ -5,7 +5,7 @@ LDFLAGS ?=
 
 BINS = agentctl agentd reviewer-agent fanout-agent psa broker-test broker-fault broker-concurrency
 TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec \
-	tests/test_input_validation tests/test_ipc_fd_cleanup tests/phase1-probe tests/crash-agent tests/runtime-regression
+	tests/test_input_validation tests/test_ipc_fd_cleanup tests/phase1-probe tests/crash-agent tests/runtime-regression tests/test_service_supervisor
 ifeq ($(shell uname -s),Linux)
 TESTS += tests/test_broker_timeout
 endif
@@ -27,6 +27,9 @@ $(LIB): $(LIBOBJS)
 	$(AR) rcs $@ $(LIBOBJS)
 
 tests: $(TESTS)
+
+tests/test_service_supervisor: tests/test_service_supervisor.c agentd.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_service_supervisor.c $(LIBOBJS)
 
 fuzz: $(FUZZ_TARGETS)
 

@@ -79,7 +79,7 @@ static long long monotonic_ms(void)
 
 /* ---------- per-agent state in agentd ---------- */
 
-enum restart_policy { POLICY_NEVER = 0, POLICY_ON_FAILURE, POLICY_ALWAYS };
+enum restart_policy { POLICY_NEVER = 0, POLICY_ON_FAILURE, POLICY_ALWAYS, POLICY_SERVICE };
 
 struct managed {
     int     used;
@@ -89,6 +89,14 @@ struct managed {
     int     broker_fd;            /* -1 unless agentd's end of broker socketpair */
     int     inbox_fd;             /* -1 unless agentd's receiver-delivery channel */
     int     cgroup_kill_fd;       /* trusted parent-opened handle; never from disk */
+    int     cgroup_events_fd;
+    enum restart_policy run_policy;
+    long long run_deadline;
+    int     timed_out;
+    int     service_admitted;
+    time_t  service_admitted_at;
+    long    service_request_timeout_ms;
+    int     critical;
     int     restart_count;
     int     consecutive_failures;
     time_t  last_started_at;
@@ -166,6 +174,7 @@ static struct managed *alloc_slot(const char *name)
             g_agents[i].broker_fd = -1;
             g_agents[i].inbox_fd = -1;
             g_agents[i].cgroup_kill_fd = -1;
+            g_agents[i].cgroup_events_fd = -1;
             snprintf(g_agents[i].name, sizeof(g_agents[i].name), "%s", name);
             return &g_agents[i];
         }
@@ -182,6 +191,9 @@ static void clear_runtime_state(struct managed *m)
     if (m->broker_fd >= 0) { close(m->broker_fd); m->broker_fd = -1; }
     if (m->inbox_fd >= 0)  { close(m->inbox_fd);  m->inbox_fd = -1; }
     if (m->cgroup_kill_fd >= 0) { close(m->cgroup_kill_fd); m->cgroup_kill_fd = -1; }
+    if (m->cgroup_events_fd >= 0) { close(m->cgroup_events_fd); m->cgroup_events_fd = -1; }
+    m->run_deadline = 0;
+    m->service_admitted = 0;
     m->pid = 0;
 }
 
@@ -192,6 +204,7 @@ static void release_slot(struct managed *m)
     if (m->broker_fd >= 0) { close(m->broker_fd); m->broker_fd = -1; }
     if (m->inbox_fd >= 0)  { close(m->inbox_fd);  m->inbox_fd = -1; }
     if (m->cgroup_kill_fd >= 0) close(m->cgroup_kill_fd);
+    if (m->cgroup_events_fd >= 0) close(m->cgroup_events_fd);
     memset(m, 0, sizeof(*m));
 }
 
@@ -218,6 +231,7 @@ static enum restart_policy load_policy(const char *name)
         return POLICY_ON_FAILURE;
     if (strcmp(v, "never")  == 0) return POLICY_NEVER;
     if (strcmp(v, "always") == 0) return POLICY_ALWAYS;
+    if (strcmp(v, "service") == 0) return POLICY_SERVICE;
     return POLICY_ON_FAILURE;
 }
 
@@ -238,8 +252,19 @@ static void persist_restart_count(struct managed *m)
 
 /* ---------- start / stop a managed agent ---------- */
 
+/* Protected per-agent service time limits use the same strict bounded grammar. */
+static long load_service_timeout(const char *name, const char *setting)
+{
+    char value[32], *end = NULL;
+    if (read_agent_setting(name, setting, value, sizeof(value)) != 0) return -1;
+    errno = 0;
+    long timeout = strtol(value, &end, 10);
+    if (errno || end == value || *end || timeout < 1 || timeout > 86400000) return -1;
+    return timeout;
+}
+
 /* Spawn a runtime, tag it as managed by agentd. Returns 0 on success. */
-static int spawn_agent(struct managed *m)
+static int spawn_agent_impl(struct managed *m)
 {
     char runtime_path[MAX_PATHBUF];
     if (load_runtime_path(m->name, runtime_path, sizeof(runtime_path)) != 0) {
@@ -247,16 +272,33 @@ static int spawn_agent(struct managed *m)
         audit_log(m->name, "agentd: cannot start (no runtime file)");
         return -1;
     }
+    m->run_policy = load_policy(m->name);
+    m->run_deadline = 0;
+    m->timed_out = 0;
+    m->service_admitted = 0;
+    m->service_request_timeout_ms = 0;
+    m->service_admitted_at = 0;
+    if (m->run_policy == POLICY_SERVICE) {
+        long timeout = load_service_timeout(m->name, "service_timeout_ms");
+        m->service_request_timeout_ms = load_service_timeout(m->name, "service_request_timeout_ms");
+        if (timeout < 0 || m->service_request_timeout_ms < 0) {
+            write_status(m->name, "failed");
+            write_agent_setting(m->name, "desired_state", "stopped");
+            errno = EINVAL; return -1;
+        }
+        m->run_deadline = monotonic_ms() + timeout;
+    }
     pid_t pid = 0;
     int broker_fd = -1, inbox_fd = -1;
-    if (spawn_agent_runtime_owned(m->name, runtime_path, "agentd",
+    if (spawn_agent_runtime_service(m->name, runtime_path, "agentd",
                             -1, -1, -1, &pid, &broker_fd, &inbox_fd,
-                            &m->cgroup_kill_fd) != 0) {
+                            &m->cgroup_kill_fd,
+                            m->run_policy == POLICY_SERVICE ? &m->cgroup_events_fd : NULL) != 0) {
         daemon_log("start %s: spawn failed: %s", m->name, strerror(errno));
         audit_log(m->name, "agentd: spawn failed: %s", strerror(errno));
         int saved = errno;
         write_status(m->name, "failed");
-        if (load_policy(m->name) == POLICY_NEVER)
+        if (m->run_policy == POLICY_NEVER || m->run_policy == POLICY_SERVICE)
             write_agent_setting(m->name, "desired_state", "stopped");
         errno = saved;
         return -1;
@@ -283,6 +325,21 @@ static int spawn_agent(struct managed *m)
     return 0;
 }
 
+/* Host-owned boundary component. A failed start or exit requires the outer
+ * service to discard all sibling state. Captured for the whole run. */
+static int spawn_agent(struct managed *m)
+{
+    char value[16];
+    m->critical = read_agent_setting(m->name, "critical", value, sizeof(value)) == 0 &&
+                  strcmp(value, "yes") == 0;
+    int rc = spawn_agent_impl(m);
+    if (rc != 0 && m->critical) {
+        daemon_log("critical agent %s failed startup; host must kill unit", m->name);
+        _exit(70);
+    }
+    return rc;
+}
+
 /* Liveness via pidfd (race-free against PID reuse) when available, else the
  * legacy kill(pid,0) probe. Returns 1 alive, 0 dead. */
 static int agent_alive(struct managed *m)
@@ -305,9 +362,31 @@ static void reap_zombies(void);
 static void kill_remaining_children(struct managed *m)
 {
     if (m->pid <= 0) return;
+    if (m->run_policy == POLICY_SERVICE) {
+        if (lifecycle_cgroup_kill_wait(m->cgroup_kill_fd, m->cgroup_events_fd, 2000) != 0) {
+            daemon_log("service boundary failed for %s; host must kill unit", m->name);
+            audit_log(m->name, "service cleanup failed; daemon exiting fail-closed");
+            _exit(70);
+        }
+        return;
+    }
     if (m->cgroup_kill_fd >= 0 &&
         write(m->cgroup_kill_fd, "1\n", 2) == 2) return;
     (void)lifecycle_signal_group(m->pid, SIGKILL);
+}
+
+static void enforce_service_deadlines(void)
+{
+    for (int i = 0; i < MAX_MANAGED; i++) {
+        struct managed *m = &g_agents[i];
+        if (!m->used || m->pid <= 0 || m->run_deadline <= 0 ||
+            monotonic_ms() < m->run_deadline) continue;
+        m->timed_out = 1;
+        m->run_deadline = 0;
+        audit_log(m->name, "service %s timeout; killing owned subtree",
+                  m->service_admitted ? "request" : "idle");
+        kill_remaining_children(m);
+    }
 }
 
 /* Stop a managed agent. Send SIGTERM to the leader and its process group.
@@ -315,6 +394,12 @@ static void kill_remaining_children(struct managed *m)
  * timeout, use cgroup.kill when available, otherwise pidfd plus killpg. */
 static int stop_agent(struct managed *m, int timeout_ms)
 {
+    if (m->pid > 0 && m->run_policy == POLICY_SERVICE) {
+        kill_remaining_children(m);
+        reap_zombies();
+        clear_runtime_state(m);
+        return 0;
+    }
     if (m->pid <= 0 || !agent_alive(m)) {
         kill_remaining_children(m);
         clear_runtime_state(m);
@@ -383,9 +468,17 @@ static void reap_zombies(void)
         struct managed *m = find_by_pid(pid);
         if (!m) continue;
         time_t now = time(NULL);
-        time_t uptime = m->last_started_at > 0 ? now - m->last_started_at : 0;
+        time_t started = m->run_policy == POLICY_SERVICE && m->service_admitted
+                         ? m->service_admitted_at : m->last_started_at;
+        time_t uptime = started > 0 ? now - started : 0;
+        int admitted = m->service_admitted;
+        int idle_retirement = m->timed_out && !admitted;
         kill_remaining_children(m);
         clear_runtime_state(m);
+        if (m->critical) {
+            daemon_log("critical agent %s exited; host must kill unit", m->name);
+            _exit(70);
+        }
         int code = 0;
         int signum = 0;
         if      (WIFEXITED(status))   code   = WEXITSTATUS(status);
@@ -403,9 +496,16 @@ static void reap_zombies(void)
             daemon_log("%s not restarted (disabled or stopped)", m->name);
             continue;
         }
-        enum restart_policy p = load_policy(m->name);
+        enum restart_policy p = m->run_policy == POLICY_SERVICE ? POLICY_SERVICE : load_policy(m->name);
+        if (p == POLICY_SERVICE && (idle_retirement || (code == 0 && !signum && !m->timed_out))) {
+            if (!idle_retirement && admitted) m->consecutive_failures = 0;
+            m->next_restart_at = now;
+            audit_log(m->name, "service %s; fresh worker scheduled",
+                      idle_retirement ? "idle retirement" : "clean completion");
+            continue;
+        }
         int should = 0;
-        if (p == POLICY_ALWAYS) should = 1;
+        if (p == POLICY_ALWAYS || p == POLICY_SERVICE) should = 1;
         else if (p == POLICY_ON_FAILURE && (signum || code != 0)) should = 1;
         if (!should) {
             audit_log(m->name, "no restart (policy=%s)",
@@ -416,7 +516,7 @@ static void reap_zombies(void)
             write_agent_setting(m->name, "desired_state", "stopped");
             continue;
         }
-        if (uptime >= RESTART_STABLE_SEC) m->consecutive_failures = 0;
+        if (p != POLICY_SERVICE && uptime >= RESTART_STABLE_SEC) m->consecutive_failures = 0;
         m->consecutive_failures++;
         m->restart_count++;
         persist_restart_count(m);
@@ -429,6 +529,10 @@ static void reap_zombies(void)
             write_status(m->name, "crash-loop");
             write_agent_setting(m->name, "desired_state", "stopped");
             m->next_restart_at = 0;
+            if (p == POLICY_SERVICE) {
+                daemon_log("service %s exhausted failure budget; host must kill unit", m->name);
+                _exit(70);
+            }
             continue;
         }
         int shift = m->consecutive_failures - 1;
@@ -437,7 +541,7 @@ static void reap_zombies(void)
         m->next_restart_at = now + delay;
         audit_log(m->name,
                   "restart scheduled policy=%s delay=%ds failure=%d",
-                  p == POLICY_ALWAYS ? "always" : "on-failure", delay,
+                  p == POLICY_SERVICE ? "service" : (p == POLICY_ALWAYS ? "always" : "on-failure"), delay,
                   m->consecutive_failures);
     }
 }
@@ -468,6 +572,13 @@ static void recover_cb_(const char *name, void *ud)
     pid_t pid;
     int has_pid = (read_pid_file(name, &pid) == 0);
     int alive   = has_pid && run_alive(pid);
+    char critical[16];
+    int is_critical = read_agent_setting(name, "critical", critical, sizeof(critical)) == 0 &&
+                      strcmp(critical, "yes") == 0;
+    if (alive && (load_policy(name) == POLICY_SERVICE || is_critical)) {
+        daemon_log("cannot adopt service %s without owned cgroup handles", name);
+        _exit(70);
+    }
     if (alive) {
         struct managed *m = alloc_slot(name);
         if (!m) return;
@@ -521,7 +632,8 @@ static void reconcile_cb_(const char *name, void *ud)
         m->external = 0;
     }
 
-    int alive = (m && m->pid > 0 && agent_alive(m));
+    if (m && !m->external && m->pid > 0 && !agent_alive(m)) reap_zombies();
+    int alive = (m && m->pid > 0);
 
     if (enabled && desire && !alive) {
         if (!m) m = alloc_slot(name);
@@ -661,6 +773,10 @@ static int issue_mailbox_channel(const char *sender, pid_t sender_pid,
     if (!dst || dst->pid <= 0 || dst->inbox_fd < 0 || !agent_alive(dst)) {
         errno = ENOENT; return -2;
     }
+    if (dst->run_policy == POLICY_SERVICE &&
+        (dst->service_admitted || dst->run_deadline <= monotonic_ms())) {
+        errno = EBUSY; return -3;
+    }
     int stype =
 #if defined(__linux__)
         SOCK_SEQPACKET;
@@ -686,13 +802,22 @@ static int issue_mailbox_channel(const char *sender, pid_t sender_pid,
     c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;
     c->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(c), &sv[1], sizeof(int));
+    /* Single-threaded supervisor linearization point: consume this fresh
+     * worker before transferring any authority. Failed delivery never reopens
+     * it, and later requests cannot renew the captured request deadline. */
+    if (dst->run_policy == POLICY_SERVICE) {
+        dst->service_admitted = 1;
+        dst->service_admitted_at = time(NULL);
+        dst->run_deadline = monotonic_ms() + dst->service_request_timeout_ms;
+    }
     ssize_t n;
     do { n = sendmsg(dst->inbox_fd, &mh, MSG_NOSIGNAL | MSG_DONTWAIT); }
     while (n < 0 && errno == EINTR);
     int saved = errno;
     close(sv[1]);
-    if (n < 0) {
-        close(sv[0]); errno = saved;
+    if (n != ml) {
+        if (dst->run_policy == POLICY_SERVICE) dst->run_deadline = monotonic_ms();
+        close(sv[0]); errno = n < 0 ? saved : EIO;
         return saved == EAGAIN || saved == EWOULDBLOCK ? -3 : -1;
     }
     *out_sender_fd = sv[0];
@@ -987,6 +1112,10 @@ static int handle_cmd_start(const char *name, char *resp, size_t n)
         snprintf(resp, n, "OK already running pid=%ld", (long)m->pid);
         return 0;
     }
+    if (m->pid > 0) {
+        reap_zombies();
+        if (m->pid > 0) { snprintf(resp, n, "ERROR prior run still pending"); return 1; }
+    }
     /* An explicit operator start clears crash-loop suppression state. */
     m->consecutive_failures = 0;
     m->next_restart_at = 0;
@@ -1216,6 +1345,10 @@ discard:
 
 static void on_signal(int sig)
 {
+    /* PID-namespace init ignores many default fatal dispositions. A caught
+     * file-size-limit signal must terminate explicitly. No logging or cleanup
+     * is safe here; the outer host service owns whole-boundary termination. */
+    if (sig == SIGXFSZ) _exit(70);
     char c;
     if (sig == SIGCHLD) { g_sigchld  = 1; c = 'c'; }
     else                { g_shutdown = 1; c = 't'; }
@@ -1236,6 +1369,7 @@ static int setup_signals(void)
     sa.sa_flags = 0;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
+    if (sigaction(SIGXFSZ, &sa, NULL) != 0) return -1;
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
     return 0;
@@ -1434,6 +1568,13 @@ int main(int argc, char **argv)
                                     : RECONCILE_INTERVAL_SEC * 1000;
         timeout_ms = scheduled_restart_timeout_ms(timeout_ms);
         long long now_ms = monotonic_ms();
+        for (int i = 0; i < MAX_MANAGED; i++) {
+            struct managed *m = &g_agents[i];
+            if (!m->used || m->pid <= 0 || m->run_deadline <= 0) continue;
+            long long left = m->run_deadline - now_ms;
+            if (left < 0) left = 0;
+            if (left < timeout_ms) timeout_ms = (int)left;
+        }
         for (int i = 0; i < MAX_CONTROL_CLIENTS; i++) {
             struct control_client *c = &g_clients[i];
             client_idx[i] = -1;
@@ -1454,6 +1595,7 @@ int main(int argc, char **argv)
             char drain[64];
             (void)!read(g_self_pipe[0], drain, sizeof(drain));
         }
+        enforce_service_deadlines();
         /* SIGCHLD path: authoritative for own children. Reaps + restarts +
          * closes pidfds. After this, own-child slots have pidfd == -1. */
         if (g_sigchld) { g_sigchld = 0; reap_zombies(); }
@@ -1506,6 +1648,13 @@ int main(int argc, char **argv)
         }
     }
 
+    for (int i = 0; i < MAX_MANAGED; i++) {
+        struct managed *m = &g_agents[i];
+        if (m->used && m->pid > 0 && m->run_policy == POLICY_SERVICE) {
+            kill_remaining_children(m);
+            clear_runtime_state(m);
+        }
+    }
     daemon_log("agentd shutting down");
     fprintf(stderr, "agentd shutting down\n");
 #if defined(__linux__)
