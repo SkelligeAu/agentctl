@@ -254,6 +254,14 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
                         int *out_broker_fd,
                         int *out_inbox_fd);
 
+/* Supervisor variant: returns an owned, CLOEXEC cgroup.kill descriptor.
+ * The caller closes it. Runtime projections must never supply this authority. */
+int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
+                        const char *supervisor_label,
+                        int fs_override, int sc_override, int cg_override,
+                        pid_t *out_pid, int *out_broker_fd, int *out_inbox_fd,
+                        int *out_cgroup_kill_fd);
+
 /* Misc */
 int refuse_root(void);
 int run_alive(pid_t pid);
@@ -297,5 +305,6 @@ int  lifecycle_signal_group(pid_t pgid, int sig);
  * Always -1 with errno=ENOSYS on non-Linux. Note: only SIGKILL — there is no
  * cgroup-native SIGTERM; graceful shutdown still uses pidfd+killpg. */
 int  lifecycle_cgroup_kill(const char *cgroup_path);
+int  lifecycle_cgroup_open(const char *cgroup_path);
 
 #endif

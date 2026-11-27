@@ -191,7 +191,19 @@ int ipc_accept(int server_fd, peer_id_t *out_peer)
         mh.msg_control = control; mh.msg_controllen = sizeof(control);
         ssize_t n;
         do { n = recvmsg(server_fd, &mh, MSG_CMSG_CLOEXEC); } while (n < 0 && errno == EINTR);
-        if (n <= 0 || (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+        if (n < 0) return -1;
+        int issued = -1, count = 0;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+            size_t nfds = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            int *fds = (int *)CMSG_DATA(c);
+            for (size_t i = 0; i < nfds; i++) {
+                if (count++ == 0) issued = fds[i];
+                else close(fds[i]);
+            }
+        }
+        if (n == 0 || count != 1 || (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+            if (issued >= 0) close(issued);
             /* EOF on the inherited delivery channel means agentd is gone.
              * Convert it to the normal runtime shutdown signal so callers do
              * not spin forever polling a permanently readable EOF. */
@@ -202,12 +214,6 @@ int ipc_accept(int server_fd, peer_id_t *out_peer)
             else if (n > 0) errno = EPROTO;
             return -1;
         }
-        int issued = -1;
-        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
-            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-                memcpy(&issued, CMSG_DATA(c), sizeof(issued)); break;
-            }
-        if (issued < 0) { errno = EPROTO; return -1; }
         set_cloexec(issued);
         meta[n] = '\0';
         if (out_peer) {
@@ -611,6 +617,8 @@ static int recv_stream_into(int fd, char *buf, size_t bufcap, size_t *out_total)
 
 int ipc_recv(int fd, void *buf, size_t bufcap, ipc_msg_t *out_msg)
 {
+    if (!out_msg) { errno = EINVAL; return IPC_ERR; }
+    out_msg->n_fds = 0;
     if (!buf || bufcap < IPC_MSG_DEFAULT_CAP) { errno = EINVAL; return IPC_ERR; }
     size_t total = 0;
 
@@ -627,13 +635,7 @@ int ipc_recv(int fd, void *buf, size_t bufcap, ipc_msg_t *out_msg)
 
     ssize_t n;
     do { n = recvmsg(fd, &mh, MSG_CMSG_CLOEXEC); } while (n < 0 && errno == EINTR);
-    if (n == 0) return IPC_PEER_GONE;
     if (n < 0)  return IPC_ERR;
-    if (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
-        /* MSG_TRUNC: oversized message. MSG_CTRUNC: cmsg overflow.
-         * Both are protocol violations; caller must close the fd. */
-        return IPC_PROTO_VIOLATION;
-    }
     total = (size_t)n;
 
     /* Walk cmsgs and collect any fds (SCM_RIGHTS). */
@@ -644,12 +646,18 @@ int ipc_recv(int fd, void *buf, size_t bufcap, ipc_msg_t *out_msg)
             if ((size_t)out_msg->n_fds + nfd > IPC_MAX_FDS) {
                 int *got = (int *)CMSG_DATA(cm);
                 for (size_t i = 0; i < nfd; i++) close(got[i]);
-                return IPC_PROTO_VIOLATION;
+                goto invalid;
             }
             memcpy(&out_msg->fds[out_msg->n_fds], CMSG_DATA(cm),
                    nfd * sizeof(int));
             out_msg->n_fds += (int)nfd;
         }
+    }
+    if (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) goto invalid;
+    if (n == 0) {
+        for (int i = 0; i < out_msg->n_fds; i++) close(out_msg->fds[i]);
+        out_msg->n_fds = 0;
+        return IPC_PEER_GONE;
     }
 #else
     int r = recv_stream_into(fd, (char *)buf, bufcap, &total);
@@ -659,9 +667,13 @@ int ipc_recv(int fd, void *buf, size_t bufcap, ipc_msg_t *out_msg)
 
     /* Parse in place. Also re-reads peer creds defensively (cheap on Linux). */
     if (parse_inplace((char *)buf, total, out_msg) != 0)
-        return IPC_PROTO_VIOLATION;
+        goto invalid;
     (void)read_peer_creds(fd, &out_msg->peer);
     return IPC_OK;
+invalid:
+    for (int i = 0; i < out_msg->n_fds; i++) close(out_msg->fds[i]);
+    out_msg->n_fds = 0;
+    return IPC_PROTO_VIOLATION;
 }
 
 /* ----------------------------------------------------------------

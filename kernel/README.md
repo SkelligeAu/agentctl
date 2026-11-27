@@ -1,262 +1,195 @@
-# `agentfs` — minimal kernel-backed agent identity + mailbox
+# agentfs kernel module
 
-> **Honest disclaimer.** This module was written on macOS, where Linux
-> kernel modules cannot be compiled or run. The helpers
-> (`agentfs-register`/`-send`/`-read`) compile clean on macOS. The kernel
-> module follows standard Linux 6.6+ conventions but has **not been
-> compiled, loaded, or stressed by me**. Read it as a careful first draft;
-> review with a kernel developer before running on a machine you care
-> about.
+`agentfs` is an experimental Linux filesystem module for agent registration and byte-message queues.
+It is not a supported production transport.
+Load it only in a disposable test VM.
 
-## Scope
+The module does not parse task messages or enforce broker policy.
+Userspace programs manage tasks, profiles, artifacts and restart decisions.
+See [research status](../docs/research.md).
 
-This is the first thing in the project to live in **ring 0**. The point is
-to test the hypothesis that **three things — and only three things — about
-an agent are worth pushing into the kernel:**
+## Filesystem layout
 
-1. **Identity.** "I am the agent named `reviewer`" — a name bound to a
-   `task_struct` that the kernel can authoritatively report.
-2. **A mailbox.** An opaque, pollable, bounded byte-message queue per
-   agent. Userspace writers enqueue, the registered runtime reads.
-3. **Lifecycle binding.** When the owning task exits, the kernel knows
-   *immediately*. The mailbox flushes, blocked readers wake, the status
-   flips to `dead`.
-
-Everything else still lives in userspace:
-
-| In kernel (this module) | In userspace (existing repo) |
-|---|---|
-| `register` file → bind name to current task_struct | profiles, configs, caps semantics, task objects, artifacts, memory modes |
-| `/agents/<name>/inbox` (opaque bytes) | VERB/LEN/REPLY-TO/TASK-ID framing |
-| Status (`running`/`dead`), pid, owner, stats | reconciler (`agentd`), restart policies, enforcement (Landlock/seccomp/cgroup) |
-
-The kernel **does not** parse any semantic protocol. It does not know what
-"review" or "ping" mean. It treats every `write()` to an `inbox` as an
-opaque blob, and every `read()` as one such blob dequeued.
-
-> *Kernel should govern. Runtime should think.*
-
-## Mount layout
-
-```
+```text
 /mnt/agentfs/
-  register              # 0200, write only — write your agent's name here
+  register
   agents/
-    <name>/             # created on registration
-      pid               # text: owning task pid
-      owner             # text: "uid=N gid=M"
-      status            # text: "running" | "dead"
-      stats             # text: per-mailbox queue depth / bytes / processed
-      inbox             # 0600, read/write/poll, opaque byte messages
-      outbox            # 0600, same shape as inbox
+    <name>/
+      pid
+      owner
+      status
+      stats
+      inbox
+      outbox
 ```
 
-## Build + load
+| File | Contents or operation |
+|---|---|
+| `register` | Write an agent name. The registering task becomes its owner. Mode 0200. |
+| `pid` | Owner task PID. |
+| `owner` | User and group IDs as `uid=N gid=M`. |
+| `status` | `running` or `dead`. |
+| `stats` | Queue depth, byte count and processed-message counters. |
+| `inbox` | Read, write and poll a byte-message queue. Mode 0600. |
+| `outbox` | A second queue with the same interface. Mode 0600. |
 
-The kernel half needs a Linux host with matching kernel headers. The
-helpers build anywhere with a C99 compiler.
+The module associates a name with a referenced `task_struct`.
+This records the owner, not the identity of each writer.
 
-```
-# On Linux (with kernel-headers / linux-headers installed):
-make                           # builds module + helpers
+## Build and load
+
+Run the module in a test guest with matching Linux kernel headers.
+Run these commands from `kernel/`:
+
+```sh
+make
 sudo insmod agentfs.ko
 sudo mkdir -p /mnt/agentfs
 sudo mount -t agentfs none /mnt/agentfs
 ```
 
-`Makefile` switches behaviour based on `uname -s`: on non-Linux it builds
-the helpers only and prints a skip notice.
+On Linux, `make` builds the module and helper programs.
+On other hosts, it builds only the helpers.
+The helpers require a C99 compiler and POSIX functions.
 
-## Demo
+For the supplied Docker and QEMU procedure, see [kernel development](dev/README.md).
+Do not load the module inside the Docker build container.
+A container shares its host's kernel.
 
-```
-$ ./agentfs-register reviewer &
-[1] 12345
-agentfs: registered 'reviewer' pid=12345
-agentfs: sleeping; signal me to unregister
+## Register and send a message
 
-$ ls /mnt/agentfs/agents/reviewer
-inbox  outbox  owner  pid  stats  status
+Keep the registration process alive while testing:
 
-$ cat /mnt/agentfs/agents/reviewer/pid
-12345
-$ cat /mnt/agentfs/agents/reviewer/status
-running
+```sh
+./agentfs-register reviewer &
+owner=$!
 
-$ echo "hello" | ./agentfs-send reviewer
-sent 6 bytes to reviewer
+ls /mnt/agentfs/agents/reviewer
+cat /mnt/agentfs/agents/reviewer/pid
+cat /mnt/agentfs/agents/reviewer/status
 
-$ ./agentfs-read reviewer
-hello
+printf 'hello\n' | ./agentfs-send reviewer
+./agentfs-read reviewer
+cat /mnt/agentfs/agents/reviewer/stats
 
-$ cat /mnt/agentfs/agents/reviewer/stats
-inbox_messages=0
-inbox_bytes=0
-inbox_processed=1
-outbox_messages=0
-outbox_bytes=0
-outbox_processed=0
-
-$ kill 12345
-$ cat /mnt/agentfs/agents/reviewer/status
-dead
+kill "$owner"
 ```
 
-Or with `poll(2)`-style blocking:
+The read helper prints `hello`.
+Before owner exit, the status is `running`.
+The periodic exit check later changes it to `dead`.
 
-```
-# Terminal A: agent runtime
-./agentfs-register reviewer
-# (separate process opens inbox and reads in a loop)
+A read on an empty live mailbox blocks unless `O_NONBLOCK` is set.
+To test blocking, run the read helper in one terminal and the send helper in another.
 
-# Terminal B
-./agentfs-read reviewer        # blocks until message arrives
+Writing a name with `echo` registers the task that performs the write.
+If that task exits immediately, the registration will not remain live.
+Use `agentfs-register` for a persistent test owner.
 
-# Terminal C
-echo "ping" | ./agentfs-send reviewer
-# Terminal B unblocks immediately and prints "ping"
-```
+## Queue limits
 
-## Design
+| Limit | Value | Error when exceeded |
+|---|---|---|
+| One message | `AGENTFS_MAX_MESSAGE`: 1 MiB. | `EMSGSIZE` |
+| Queued bytes per mailbox | `AGENTFS_MAX_QUEUE_BYTES`: 8 MiB. | `ENOSPC` |
+| Queued messages per mailbox | `AGENTFS_MAX_QUEUE_MSGS`: 1024. | `ENOSPC` |
 
-### Locking model
+Each message uses a `struct agent_message` with a variable-length byte buffer.
+Allocation uses `kmalloc(struct_size(...), GFP_KERNEL)`.
 
-Two mutex layers, no spinlocks (no atomic-context callers):
+A successful write enqueues one message.
+A read removes one message.
+If the caller's buffer is smaller than the message, the read returns only the bytes that fit.
+The remaining bytes are discarded.
+Use a sufficiently large receive buffer.
 
-- **`g_agents_lock`** (module-global mutex) — protects the agent list. Held
-  while iterating, adding, or removing.
-- **`agent->lock`** (per-agent mutex) — protects both mailboxes and the
-  `dead` flag. Held during enqueue, dequeue, drain, status read. Never
-  held across `copy_to_user`/`copy_from_user` — the message is dequeued
-  under the lock, then copied out unlocked.
+The module does not retain messages after they are read or drained.
 
-`messages_processed` is `atomic64_t` so the stats file doesn't need the
-mutex for that counter.
+## Locks and counters
 
-### Memory model
+`g_agents_lock` protects the global agent list.
+Each agent's mutex protects its mailboxes and `dead` flag.
 
-- Per-message buffer = `struct agent_message { size_t len; char data[]; }`
-  allocated via `kmalloc(struct_size(...), GFP_KERNEL)`.
-- Per-mailbox queue is bounded by `AGENTFS_MAX_QUEUE_BYTES` (8 MiB) and
-  `AGENTFS_MAX_QUEUE_MSGS` (1024). Writes past either limit return
-  `-ENOSPC`.
-- Per-message size is bounded by `AGENTFS_MAX_MESSAGE` (1 MiB). Larger
-  writes return `-EMSGSIZE`.
+The read path removes the message under the mutex.
+It releases the mutex before `copy_to_user`.
+The write path performs `copy_from_user` before acquiring the mutex.
 
-### Lifecycle model
+Processed-message counters use `atomic64_t`.
 
-Registration calls `task_work_add(current, &a->exit_work, TWA_NONE)`.
-When the owning task exits, the kernel walks its task_work list as part of
-`do_exit()` and invokes our callback. The callback:
+## Owner exit and name reuse
 
-1. Acquires `agent->lock`.
-2. Sets `a->dead = true`.
-3. Drains both mailboxes (frees queued messages).
-4. Releases the lock.
-5. Wakes all waiters on both `readq`s.
-6. Drops the `task_struct` reference.
+A delayed work item checks owners at a two-second interval.
+It uses `pid_alive` to find owners whose tasks have been released.
+Exit detection is not immediate.
 
-**The agent struct stays in the tree** after the owner dies — the
-directory entries and files remain visible, status reads return `dead`,
-and reads on a drained inbox return 0 (EOF). This matches the spec's "OR
-marked stale" allowance. Module unload removes everything.
+For an exited owner, the worker:
 
-### Race-safe cleanup at module unload
+1. Marks the agent dead.
+2. Drains the inbox and outbox.
+3. Wakes blocked readers.
+4. Releases the owner task reference.
 
-`agentfs_exit` is what runs when the user `rmmod`s. Because every file_op
-sets `.owner = THIS_MODULE`, rmmod is blocked while files are open, so we
-know there are no in-flight readers/writers when we get here. The
-remaining concern is **the exit callback racing with us:**
+A dead, drained mailbox returns zero from read.
+The directory remains visible.
 
-- We acquire `agent->lock`.
-- If `dead` is already `true`, the callback ran — it already freed
-  messages and dropped the task ref, so we just `kfree(a)`.
-- If `dead` is `false`, we call `task_work_cancel()`. A non-NULL return
-  means we yanked the callback before it ran and still own the task ref.
-  NULL means it either never armed or is mid-execution.
-- We drain messages, drop the task ref iff we own it, set `dead = true`,
-  release the lock, wake waiters (no-op now), and `kfree(a)`.
+Registration refuses a name while its previous owner is alive.
+After owner exit, registration can reuse the entry.
+It replaces owner metadata, clears queues and resets processed-message counters.
 
-### Poll / select / epoll
+The implementation uses a workqueue, not a `task_work_add` exit callback.
 
-Each mailbox has its own `wait_queue_head_t readq`. `poll_wait` registers
-the calling task on it. The returned mask is:
+## Polling
 
-- `EPOLLIN | EPOLLRDNORM` if the queue is non-empty
-- `EPOLLOUT | EPOLLWRNORM` if the queue has room
-- `EPOLLHUP` if the agent is dead
+Each mailbox has a read wait queue.
+`poll_wait` registers the caller.
 
-This means `epoll` over many mailboxes works without polling — readers
-wake when a writer enqueues, dead-detection wakes everything.
-
-### Userspace responsibilities — what the kernel does *not* know
-
-The kernel sees only `read()` and `write()` calls with opaque payloads.
-It does not parse:
-
-- `VERB review` / `LEN 247` / `TASK-ID ...` / `REPLY-TO ...`
-- task lifecycle (`queued → running → completed`)
-- profiles, configs, restart policies, caps semantics, enforcement
-- artifacts, memory modes, planners
-
-All of that stays in the userspace runtime (`reviewer-agent`,
-`fanout-agent`, `agentd`, `agentctl`). The kernel only provides:
-
-1. A stable identity (name → process)
-2. A datagram-shaped buffer (read/write/poll/blocking)
-3. Death detection (`status` flips, readers get EOF, `EPOLLHUP` fires)
-
-## What this is *not*
-
-- **Not a sandbox.** Filesystem permissions on `/mnt/agentfs/` are the
-  only access control. For real isolation use Landlock + seccomp +
-  cgroup v2 (the existing userspace layer).
-- **Not a security boundary.** The mailbox is opaque-bytes; if a peer
-  with write access misbehaves, the kernel doesn't help. Audit it
-  via existing userspace tooling.
-- **Not an orchestrator.** No tasks, no scheduling, no DAGs, no policy.
-- **Not a database.** Messages are FIFO byte payloads; the kernel keeps
-  no record once a message is dequeued.
-- **Not an "AI in the kernel" project.** The kernel still has zero
-  knowledge of models, prompts, embeddings, or planners.
-
-## Known caveats / first-draft limitations
-
-- **Not run-tested.** I built this on macOS. It should compile on
-  Linux 6.6+ but I have not verified.
-- **Re-registration of dead agents is refused.** Once an agent is in the
-  tree, the name is taken until module unload. (Easier rule for v1;
-  spec explicitly allowed either choice.)
-- **`task_work_add` can fail** if the registering task is itself in the
-  middle of exiting. The module warns via `pr_warn` and leaves the agent
-  status as `running` forever in that pathological case.
-- **`rmmod` requires `umount` first.** Active mounts hold no module ref,
-  but open files on them do. Standard pseudo-fs convention.
-- **No re-registration of the same name.** A name that was once
-  registered stays in the tree (showing `dead`) until module unload.
-
-## Code map
-
-| File | Role |
+| Mask | Condition |
 |---|---|
-| `agentfs.c` | The LKM (filesystem registration, super_block, file_ops, lifecycle hook). |
-| `Makefile` | Builds the module via kbuild on Linux; builds helpers everywhere. |
-| `agentfs-register.c` | Userspace: `write()` a name, then `pause()` until killed. |
-| `agentfs-send.c` | Userspace: copy stdin into one `write()` call on `inbox`. |
-| `agentfs-read.c` | Userspace: one `read()` from `inbox` to stdout. |
+| `EPOLLIN | EPOLLRDNORM` | A message is queued. |
+| `EPOLLOUT | EPOLLWRNORM` | The live mailbox has queue capacity. |
+| `EPOLLHUP` | The owner has been marked dead. |
 
-## How this maps from the existing userspace POC
+Writes wake readers.
+The exit worker wakes readers when it marks an owner dead.
 
-| Userspace concept | Kernel analogue (this module) |
+## Module removal
+
+Stop helper processes and close mailbox files before removal:
+
+```sh
+sudo umount /mnt/agentfs
+sudo rmmod agentfs
+```
+
+The file operations hold module references while files are open.
+During module exit, `cancel_delayed_work_sync` stops the exit worker.
+The module then unregisters the filesystem, drains queues, releases task references and frees agent records.
+It destroys the workqueue last.
+
+Do not treat this description as proof that all module cleanup races have been tested.
+
+## Security and application responsibilities
+
+Filesystem permissions control access to mailbox files.
+The module does not provide a sandbox or isolate hostile writers.
+The normal userspace restrictions also do not establish complete isolation between hostile same-user programs.
+
+The module does not interpret `VERB`, `LEN`, `TASK-ID` or `REPLY-TO`.
+Applications must validate their messages.
+A mailbox does not authenticate each message sender.
+
+The module does not manage task state, schedules, profiles, capability policy, artifacts or model operations.
+Kernel log messages are not a replacement for the supervisor's audit records.
+
+## Source files
+
+| File | Purpose |
 |---|---|
-| `/tmp/agents/<name>/pid` | `/mnt/agentfs/agents/<name>/pid` |
-| `/tmp/agents/<name>/status` (file written by runtime) | `/mnt/agentfs/agents/<name>/status` (kernel-derived) |
-| `agent.sock` (UDS, peer creds) | `inbox` + `outbox` (queues, kernel-known owner) |
-| `audit_log()` lines | `dmesg` (`pr_info` traces) |
-| `agentd` reconciler watching files via inotify | (future) a kernel-side notifier or a thin userspace consumer of `EPOLLHUP` |
+| `agentfs.c` | Filesystem registration, mailbox operations and owner exit checks. |
+| `Makefile` | Module build and userspace helpers. |
+| `agentfs-register.c` | Register a name and wait for a signal. |
+| `agentfs-send.c` | Copy standard input into one inbox write. |
+| `agentfs-read.c` | Copy one inbox read to standard output. |
 
-The existing userspace POC keeps working — `agentfs` is parallel
-infrastructure for testing the kernel-worthiness of just these three
-primitives. Userspace runtimes that already exist (`reviewer-agent` etc.)
-can be ported to read/write `/mnt/agentfs/agents/<name>/inbox` instead of
-the UDS in a small future commit, but that is **not done in this phase**.
+The userspace socket transport remains the supported implementation.
+Experimental agentfs transport code must be tested separately.

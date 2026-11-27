@@ -1,52 +1,58 @@
-# Research artifact: `agentfs.ko`
+# agentfs research module
 
-**Status: research-only. Not for production. Not maintained as a path of
-record.** Listed here to keep the kernel-side IPC experiment out of the
-main README.
+`agentfs.ko` is research code.
+It is not a supported production transport or a security boundary.
+The supported userspace transport uses UNIX domain sockets.
 
-## What it is
+## Purpose
 
-A small out-of-tree Linux kernel module that exposes a pseudo-filesystem
-at a chosen mount point and pushes three things into the kernel:
+The module tests kernel-managed agent names and bounded mailboxes.
+It provides:
 
-- agent identity, bound to a `task_struct` via a `register` file
-- per-agent in-kernel mailbox files (one inbox, one outbox)
-- lifecycle binding via a 2-second periodic workqueue reaper
+- A registered name associated with a task.
+- Inbox and outbox files containing byte messages.
+- A periodic check for tasks that have exited.
 
-The userland POC end-to-end-tested this in QEMU as scenarios C/D/E of
-`kernel/dev/share/agentfs-test.sh`.
+The check runs at a two-second interval.
+It does not detect exit immediately.
 
-## Why it is not the recommended substrate
+Userspace programs still manage message headers, tasks, profiles, artifacts and restart policies.
 
-Every problem `agentfs.ko` was meant to solve has been solved better in
-userspace, and the kernel artifact carries costs the userspace path
-does not:
+## Limits
 
-- **Death detection**: `pidfd` + `SIGCHLD` (userspace) is race-free and
-  immediate. The 2 s reaper is strictly worse.
-- **Per-message peer identity**: `SO_PEERCRED` (userspace) is
-  kernel-verified. The kernel mailbox is opaque; receivers fall back
-  to a `REPLY-TO` header (a userspace claim).
-- **Atomic message delivery**: `SOCK_SEQPACKET` (userspace) provides
-  one-sendmsg-one-recvmsg semantics with no out-of-tree code.
-- **Auditability**: the module has had no fuzzing, no KASAN, no
-  syzkaller, no security review. Calling its surface a security
-  boundary today would be irresponsible.
-- **Operational cost**: kernel headers, `CAP_SYS_MODULE` to load, no
-  rootless support, no container support, no DKMS, no signing path.
+The userspace supervisor uses pidfds and `SIGCHLD` for process exit handling.
+The module uses periodic checks.
+
+Direct UNIX socket connections provide `SO_PEERCRED`.
+The module mailbox does not provide the same sender metadata.
+A `REPLY-TO` header remains a sender-supplied value.
+
+`SOCK_SEQPACKET` provides message boundaries without an out-of-tree module.
+The module adds kernel build, loading and maintenance requirements.
+
+No module fuzzing, KASAN or syzkaller results are recorded here.
+Review and test the module before running it outside a disposable VM.
+Module loading requires host privileges.
+A Docker container does not provide a separate kernel for loading modules.
 
 ## Files
 
-- `kernel/agentfs.c` — the module (~800 LoC)
-- `kernel/Makefile` — out-of-tree build
-- `kernel/agentfs-{register,send,read}.c` — userspace probes
-- `kernel/dev/` — Docker + QEMU dev environment
-- `kernel/dev/share/agentfs-test.sh` — exercises scenarios C/D/E
+| Path | Purpose |
+|---|---|
+| `kernel/agentfs.c` | Kernel module. |
+| `kernel/Makefile` | Module and helper builds. |
+| `kernel/agentfs-register.c` | Registration helper. |
+| `kernel/agentfs-send.c` | Message writer. |
+| `kernel/agentfs-read.c` | Message reader. |
+| `kernel/dev/` | Docker build and QEMU test tools. |
+| `kernel/dev/share/agentfs-test.sh` | Generated integration script, when present. |
 
-## If you want to run it
+Earlier QEMU scenarios C, D and E exercised the module transport.
+Those records do not qualify it for production use.
 
-See `kernel/dev/README.md`. The integration test target boots a
-QEMU/aarch64 VM with the module loaded and the test script running:
+## Run the experiment
+
+See [kernel development](../kernel/dev/README.md) for prerequisites.
 
 ```sh
 cd kernel/dev
@@ -54,19 +60,9 @@ make module
 make qemu
 ```
 
-Test exit 0 on a clean run.
+The kernel and initramfs must already be built.
+A successful test script returns zero.
 
-## Not maintained as a path of record
-
-The architectural direction (locked in
-`memory/project_agentctl_invariants.md`) is:
-
-- Userspace `SOCK_SEQPACKET` + `pidfd` + `SCM_RIGHTS` is the production
-  substrate.
-- `agentfs.ko` exists as a historical experiment in "what would it look
-  like to push these primitives into a small kernel surface?" and is
-  preserved for reference, not extension.
-
-If a future requirement appears that the userspace path genuinely
-cannot satisfy, that's the moment to reopen the kernel-side question —
-not before.
+Keep userspace as the supported transport.
+Any proposal to extend the module must identify a requirement that the userspace implementation cannot meet.
+See [design invariants](design-invariants.md).

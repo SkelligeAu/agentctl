@@ -58,6 +58,24 @@
 #define RESTART_STABLE_SEC     30
 #define RESTART_BACKOFF_MAX_SEC 30
 #define RESTART_BURST_LIMIT    5
+#define MAX_CONTROL_CLIENTS 64
+#define CONTROL_TIMEOUT_MS 5000
+
+static char g_control_token[65]; /* loaded and validated before any child */
+struct control_client {
+    int fd;
+    size_t used;
+    long long deadline;
+    char line[1024];
+};
+static struct control_client g_clients[MAX_CONTROL_CLIENTS];
+
+static long long monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* ---------- per-agent state in agentd ---------- */
 
@@ -70,6 +88,7 @@ struct managed {
     int     pidfd;                /* -1 unless we hold a pidfd for `pid` (Linux only) */
     int     broker_fd;            /* -1 unless agentd's end of broker socketpair */
     int     inbox_fd;             /* -1 unless agentd's receiver-delivery channel */
+    int     cgroup_kill_fd;       /* trusted parent-opened handle; never from disk */
     int     restart_count;
     int     consecutive_failures;
     time_t  last_started_at;
@@ -146,6 +165,7 @@ static struct managed *alloc_slot(const char *name)
             g_agents[i].pidfd = -1;
             g_agents[i].broker_fd = -1;
             g_agents[i].inbox_fd = -1;
+            g_agents[i].cgroup_kill_fd = -1;
             snprintf(g_agents[i].name, sizeof(g_agents[i].name), "%s", name);
             return &g_agents[i];
         }
@@ -161,6 +181,7 @@ static void clear_runtime_state(struct managed *m)
     if (m->pidfd >= 0)     { close(m->pidfd);     m->pidfd = -1; }
     if (m->broker_fd >= 0) { close(m->broker_fd); m->broker_fd = -1; }
     if (m->inbox_fd >= 0)  { close(m->inbox_fd);  m->inbox_fd = -1; }
+    if (m->cgroup_kill_fd >= 0) { close(m->cgroup_kill_fd); m->cgroup_kill_fd = -1; }
     m->pid = 0;
 }
 
@@ -170,6 +191,7 @@ static void release_slot(struct managed *m)
     if (m->pidfd >= 0)     { close(m->pidfd);     m->pidfd = -1; }
     if (m->broker_fd >= 0) { close(m->broker_fd); m->broker_fd = -1; }
     if (m->inbox_fd >= 0)  { close(m->inbox_fd);  m->inbox_fd = -1; }
+    if (m->cgroup_kill_fd >= 0) close(m->cgroup_kill_fd);
     memset(m, 0, sizeof(*m));
 }
 
@@ -227,8 +249,9 @@ static int spawn_agent(struct managed *m)
     }
     pid_t pid = 0;
     int broker_fd = -1, inbox_fd = -1;
-    if (spawn_agent_runtime(m->name, runtime_path, "agentd",
-                            -1, -1, -1, &pid, &broker_fd, &inbox_fd) != 0) {
+    if (spawn_agent_runtime_owned(m->name, runtime_path, "agentd",
+                            -1, -1, -1, &pid, &broker_fd, &inbox_fd,
+                            &m->cgroup_kill_fd) != 0) {
         daemon_log("start %s: spawn failed: %s", m->name, strerror(errno));
         audit_log(m->name, "agentd: spawn failed: %s", strerror(errno));
         return -1;
@@ -272,13 +295,23 @@ static int agent_alive(struct managed *m)
  * reapable after waitpid()) so the liveness probe doesn't spin on a zombie. */
 static void reap_zombies(void);
 
-/* Stop a managed agent. Send SIGTERM to the leader via pidfd (race-free),
- * then to the rest of the process group via killpg() for any forked children
- * (cgroup.kill is the planned upgrade for cgroup-active profiles).
- * Poll for exit, escalate to SIGKILL. */
+/* Once the leader exits, descendants must not outlive its supervision.
+ * Use the owned cgroup when available; otherwise clean up its process group. */
+static void kill_remaining_children(struct managed *m)
+{
+    if (m->pid <= 0) return;
+    if (m->cgroup_kill_fd >= 0 &&
+        write(m->cgroup_kill_fd, "1\n", 2) == 2) return;
+    (void)lifecycle_signal_group(m->pid, SIGKILL);
+}
+
+/* Stop a managed agent. Send SIGTERM to the leader and its process group.
+ * Reaping cleans up descendants even when the leader exits first. On
+ * timeout, use cgroup.kill when available, otherwise pidfd plus killpg. */
 static int stop_agent(struct managed *m, int timeout_ms)
 {
     if (m->pid <= 0 || !agent_alive(m)) {
+        kill_remaining_children(m);
         clear_runtime_state(m);
         return 0;
     }
@@ -315,13 +348,10 @@ static int stop_agent(struct managed *m, int timeout_ms)
     /* Prefer cgroup.kill — atomic subtree SIGKILL, race-immune to PID/PGID
      * reuse — when the profile has cgroup ownership and the cgroup exists.
      * Fall back to pidfd+killpg otherwise. */
-    enforcement_state_t es;
     int used_cgroup = 0;
-    if (enforcement_read_state(m->name, &es) == 0 &&
-        es.cgroup_status == ENF_STATUS_ACTIVE && es.cgroup_path[0]) {
-        if (lifecycle_cgroup_kill(es.cgroup_path) == 0) {
-            audit_log(m->name, "agentd: cgroup.kill atomic subtree SIGKILL "
-                      "path=%s", es.cgroup_path);
+    if (m->cgroup_kill_fd >= 0) {
+        if (write(m->cgroup_kill_fd, "1\n", 2) == 2) {
+            audit_log(m->name, "agentd: cgroup.kill atomic subtree SIGKILL");
             used_cgroup = 1;
         } else {
             audit_log(m->name, "agentd: cgroup.kill failed (%s); "
@@ -349,6 +379,7 @@ static void reap_zombies(void)
         if (!m) continue;
         time_t now = time(NULL);
         time_t uptime = m->last_started_at > 0 ? now - m->last_started_at : 0;
+        kill_remaining_children(m);
         clear_runtime_state(m);
         int code = 0;
         int signum = 0;
@@ -604,9 +635,17 @@ static int broker_reply(int chan_fd, const char *bytes, size_t len, int fd_or_ne
         memcpy(CMSG_DATA(c), &fd_or_neg, sizeof(int));
     }
     ssize_t n;
-    do { n = sendmsg(chan_fd, &mh, MSG_NOSIGNAL); }
+    do { n = sendmsg(chan_fd, &mh, MSG_NOSIGNAL | MSG_DONTWAIT); }
     while (n < 0 && errno == EINTR);
-    return (n < 0) ? -1 : 0;
+    if (n != (ssize_t)len) {
+        /* No reply queue: a caller that does not read loses its channel.
+         * Also discard partial STREAM replies rather than desynchronising it. */
+        int saved = n < 0 ? errno : EIO;
+        (void)shutdown(chan_fd, SHUT_RDWR);
+        errno = saved;
+        return -1;
+    }
+    return 0;
 }
 
 static int issue_mailbox_channel(const char *sender, pid_t sender_pid,
@@ -643,9 +682,14 @@ static int issue_mailbox_channel(const char *sender, pid_t sender_pid,
     c->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(c), &sv[1], sizeof(int));
     ssize_t n;
-    do { n = sendmsg(dst->inbox_fd, &mh, MSG_NOSIGNAL); } while (n < 0 && errno == EINTR);
+    do { n = sendmsg(dst->inbox_fd, &mh, MSG_NOSIGNAL | MSG_DONTWAIT); }
+    while (n < 0 && errno == EINTR);
+    int saved = errno;
     close(sv[1]);
-    if (n < 0) { int saved = errno; close(sv[0]); errno = saved; return -1; }
+    if (n < 0) {
+        close(sv[0]); errno = saved;
+        return saved == EAGAIN || saved == EWOULDBLOCK ? -3 : -1;
+    }
     *out_sender_fd = sv[0];
     return 0;
 }
@@ -665,25 +709,32 @@ static void broker_handle_event(struct managed *m)
     ssize_t n;
     do { n = recvmsg(m->broker_fd, &mh, MSG_CMSG_CLOEXEC); }
     while (n < 0 && errno == EINTR);
-    if (n <= 0) {
+    if (n < 0) {
         /* EOF or error: agent closed broker channel or died. Drop the fd. */
         close(m->broker_fd); m->broker_fd = -1;
         return;
     }
-    if (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
-        daemon_log("broker %s: oversized or cmsg-truncated; closing channel",
-                   m->name);
-        audit_log(m->name, "broker protocol violation (truncated); channel closed");
-        close(m->broker_fd); m->broker_fd = -1;
-        return;
-    }
-    /* Defensively close any inbound fds — v1 doesn't accept delegation. */
+    /* Even a truncated message installs the descriptors that fit. Close
+     * them before every rejection path; closing the socket is insufficient. */
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
             size_t nfd = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
             int *fds = (int *)CMSG_DATA(c);
             for (size_t k = 0; k < nfd; k++) close(fds[k]);
         }
+    }
+
+    if (n == 0) {
+        close(m->broker_fd); m->broker_fd = -1;
+        return;
+    }
+
+    if (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
+        daemon_log("broker %s: oversized or cmsg-truncated; closing channel",
+                   m->name);
+        audit_log(m->name, "broker protocol violation (truncated); channel closed");
+        close(m->broker_fd); m->broker_fd = -1;
+        return;
     }
 
     broker_msg_t req;
@@ -720,7 +771,8 @@ static void broker_handle_event(struct managed *m)
         int issue_rc = issue_mailbox_channel(m->name, m->pid, getuid(),
                                              target, &cap_fd);
         if (issue_rc < 0) {
-            const char *reason = (issue_rc == -2) ? "no-listener" : strerror(errno);
+            const char *reason = issue_rc == -2 ? "no-listener" :
+                                 issue_rc == -3 ? "target-busy" : strerror(errno);
             char resp[BROKER_MSG_MAX];
             int rl = broker_format_denied(resp, sizeof(resp), req.cap, reason);
             if (rl > 0) (void)broker_reply(m->broker_fd, resp, (size_t)rl, -1);
@@ -970,6 +1022,28 @@ static int handle_cmd_restart(const char *name, char *resp, size_t n)
     return handle_cmd_start(name, resp, n);
 }
 
+static int handle_cmd_kill(const char *name, char *resp, size_t n)
+{
+    if (validate_name(name) != 0) {
+        snprintf(resp, n, "ERROR invalid name"); return 1;
+    }
+    write_agent_setting(name, "desired_state", "stopped");
+    struct managed *m = find_by_name(name);
+    if (m) {
+        (void)stop_agent(m, 0);
+        for (int i = 0; i < 50 && agent_alive(m); i++) {
+            reap_zombies();
+            if (!agent_alive(m)) break;
+            struct timespec delay = { 0, 10000000 };
+            nanosleep(&delay, NULL);
+        }
+        if (agent_alive(m)) { snprintf(resp, n, "ERROR kill did not complete"); return 1; }
+        release_slot(m);
+    }
+    snprintf(resp, n, "OK killed");
+    return 0;
+}
+
 static int handle_cmd_reload(const char *name, char *resp, size_t n)
 {
     if (validate_name(name) != 0) {
@@ -1022,6 +1096,7 @@ static int handle_command(const char *line, char *resp, size_t n)
 
     if (strcmp(verb, "start")    == 0) return handle_cmd_start(arg, resp, n);
     if (strcmp(verb, "stop")     == 0) return handle_cmd_stop(arg, resp, n);
+    if (strcmp(verb, "kill")     == 0) return handle_cmd_kill(arg, resp, n);
     if (strcmp(verb, "restart")  == 0) return handle_cmd_restart(arg, resp, n);
     if (strcmp(verb, "reload")   == 0) return handle_cmd_reload(arg, resp, n);
     if (strcmp(verb, "status")   == 0) return handle_cmd_status(arg, resp, n);
@@ -1047,55 +1122,32 @@ static int handle_command(const char *line, char *resp, size_t n)
     return 1;
 }
 
-/* Read one line from the client, dispatch, write response, close. */
-static void serve_one_connection(int srv)
+/* Dispatch only complete lines. The poll loop owns partial requests. */
+static void serve_control_line(int fd, char *line)
 {
-    int fd = accept(srv, NULL, NULL);
-    if (fd == -1) return;
-    int f = fcntl(fd, F_GETFD); if (f != -1) fcntl(fd, F_SETFD, f | FD_CLOEXEC);
-    struct timeval tv = { 5, 0 };
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
     /* Same-uid only. */
     peer_id_t peer;
-    if (get_peer_creds(fd, &peer) == 0 && peer.uid != 0 && peer.uid != getuid()) {
+    if (get_peer_creds(fd, &peer) != 0 || (peer.uid != 0 && peer.uid != getuid())) {
         const char *m = "ERROR forbidden uid\n";
-        (void)!write(fd, m, strlen(m));
+        (void)send(fd, m, strlen(m), MSG_DONTWAIT | MSG_NOSIGNAL);
         close(fd);
         return;
     }
 
-    char line[1024];
-    size_t off = 0;
-    while (off + 1 < sizeof(line)) {
-        ssize_t r = read(fd, line + off, sizeof(line) - 1 - off);
-        if (r == -1) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (r == 0) break;
-        off += (size_t)r;
-        if (memchr(line, '\n', off)) break;
-    }
-    if (off == 0) { close(fd); return; }
-    line[off] = '\0';
     char *nl = strchr(line, '\n');
     if (nl) *nl = '\0';
 
     char resp[512];
-    char expected[129];
-    if (read_small_file(agentd_token_path(), expected, sizeof(expected), NULL) != 0) {
+    if (strlen(g_control_token) != 64) {
         snprintf(resp, sizeof(resp), "ERROR control authentication unavailable");
     } else {
-        expected[strcspn(expected, "\r\n")] = '\0';
         const char *command = line;
         int authenticated = 0;
         if (strncmp(command, "AUTH ", 5) == 0) {
             const char *presented = command + 5;
             const char *space = strchr(presented, ' ');
-            if (space && (size_t)(space - presented) == strlen(expected) &&
-                memcmp(presented, expected, strlen(expected)) == 0) {
+            if (space && (size_t)(space - presented) == 64 &&
+                memcmp(presented, g_control_token, 64) == 0) {
                 authenticated = 1;
                 command = space + 1;
             }
@@ -1117,8 +1169,42 @@ static void serve_one_connection(int srv)
     }
     size_t rl = strlen(resp);
     if (rl < sizeof(resp) - 1) { resp[rl++] = '\n'; resp[rl] = '\0'; }
-    (void)!write_all(fd, resp, rl);
+    (void)send(fd, resp, rl, MSG_DONTWAIT | MSG_NOSIGNAL);
     close(fd);
+}
+
+static void accept_control_client(int srv)
+{
+    int fd = accept(srv, NULL, NULL);
+    if (fd < 0) return;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(fd, F_SETFL, O_NONBLOCK) < 0) { close(fd); return; }
+    for (int i = 0; i < MAX_CONTROL_CLIENTS; i++) {
+        if (g_clients[i].fd >= 0) continue;
+        g_clients[i].fd = fd;
+        g_clients[i].used = 0;
+        g_clients[i].deadline = monotonic_ms() + CONTROL_TIMEOUT_MS;
+        return;
+    }
+    close(fd);
+}
+
+static void read_control_client(struct control_client *c)
+{
+    ssize_t n = recv(c->fd, c->line + c->used,
+                     sizeof(c->line) - 1 - c->used, MSG_DONTWAIT);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+    if (n <= 0 || memchr(c->line + c->used, '\0', (size_t)n)) goto discard;
+    c->used += (size_t)n;
+    c->line[c->used] = '\0';
+    if (memchr(c->line, '\n', c->used)) {
+        serve_control_line(c->fd, c->line);
+        c->fd = -1;
+        return;
+    }
+    if (c->used < sizeof(c->line) - 1) return;
+discard:
+    close(c->fd); c->fd = -1;
 }
 
 /* ---------- signals + main loop ---------- */
@@ -1199,6 +1285,20 @@ static int ensure_control_token(void)
             errno = EACCES;
             return -1;
         }
+        int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) return -1;
+        char data[66];
+        ssize_t n = read_all(fd, data, sizeof(data));
+        struct stat opened;
+        int valid = fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode) &&
+            opened.st_uid == geteuid() && !(opened.st_mode & 0077) &&
+            (n == 64 || (n == 65 && data[64] == '\n'));
+        close(fd);
+        if (valid) for (int i = 0; i < 64; i++)
+            if (!((data[i] >= '0' && data[i] <= '9') ||
+                  (data[i] >= 'a' && data[i] <= 'f'))) valid = 0;
+        if (!valid) { errno = EINVAL; return -1; }
+        memcpy(g_control_token, data, 64); g_control_token[64] = '\0';
         return 0;
     }
     if (errno != ENOENT) return -1;
@@ -1216,7 +1316,9 @@ static int ensure_control_token(void)
         token[i * 2 + 1] = hex[raw[i] & 15];
     }
     token[64] = '\n';
-    return atomic_write_file(path, token, sizeof(token), 0600);
+    if (atomic_write_file(path, token, sizeof(token), 0600) != 0) return -1;
+    memcpy(g_control_token, token, 64); g_control_token[64] = '\0';
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -1274,12 +1376,14 @@ int main(int argc, char **argv)
 
     /* Recovery scan. */
     scan_disk_agents(recover_cb_, NULL);
+    for (int i = 0; i < MAX_CONTROL_CLIENTS; i++) g_clients[i].fd = -1;
 
     while (!g_shutdown) {
         /* Fixed-tier pollfds: control socket, self-pipe, optional inotify;
          * then one slot per managed agent's pidfd, then one per broker_fd.
-         * Bounded by 3 + 2*MAX_MANAGED. */
-        struct pollfd pfd[3 + 2 * MAX_MANAGED];
+         * plus bounded partial control requests. */
+        struct pollfd pfd[3 + 2 * MAX_MANAGED + MAX_CONTROL_CLIENTS];
+        int client_idx[MAX_CONTROL_CLIENTS];
         int pidfd_pfd_idx[MAX_MANAGED];
         int broker_pfd_idx[MAX_MANAGED];
         for (int i = 0; i < MAX_MANAGED; i++) {
@@ -1324,6 +1428,17 @@ int main(int argc, char **argv)
         int timeout_ms = inotify_ok ? INOTIFY_SAFETY_SEC * 1000
                                     : RECONCILE_INTERVAL_SEC * 1000;
         timeout_ms = scheduled_restart_timeout_ms(timeout_ms);
+        long long now_ms = monotonic_ms();
+        for (int i = 0; i < MAX_CONTROL_CLIENTS; i++) {
+            struct control_client *c = &g_clients[i];
+            client_idx[i] = -1;
+            if (c->fd < 0) continue;
+            long long left = c->deadline - now_ms;
+            if (left <= 0) { close(c->fd); c->fd = -1; continue; }
+            if (left < timeout_ms) timeout_ms = (int)left;
+            client_idx[i] = npfd;
+            pfd[npfd++] = (struct pollfd){ .fd = c->fd, .events = POLLIN };
+        }
         int pr = poll(pfd, (nfds_t)npfd, timeout_ms);
         if (pr == -1) {
             if (errno == EINTR) continue;
@@ -1337,7 +1452,14 @@ int main(int argc, char **argv)
         /* SIGCHLD path: authoritative for own children. Reaps + restarts +
          * closes pidfds. After this, own-child slots have pidfd == -1. */
         if (g_sigchld) { g_sigchld = 0; reap_zombies(); }
-        if (pfd[srv_idx].revents & POLLIN) serve_one_connection(srv);
+        for (int i = 0; i < MAX_CONTROL_CLIENTS; i++) {
+            struct control_client *c = &g_clients[i];
+            int idx = client_idx[i];
+            if (c->fd < 0) continue;
+            if (monotonic_ms() >= c->deadline) { close(c->fd); c->fd = -1; }
+            else if (idx >= 0 && pfd[idx].revents) read_control_client(c);
+        }
+        if (pfd[srv_idx].revents & POLLIN) accept_control_client(srv);
 #if defined(__linux__)
         if (in_idx >= 0 && (pfd[in_idx].revents & POLLIN)) inotify_drain();
 #endif

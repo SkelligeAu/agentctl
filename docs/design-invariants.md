@@ -1,263 +1,264 @@
-# Design invariants
+# Design requirements
 
-An **invariant** in this file is a rule whose violation changes the
-runtime model: liveness, atomicity, ordering, identity, or authority.
+This document defines required behavior, implementation choices and known limits.
+A stated requirement is not proof that every code path meets it.
+Tests cover the cases listed below.
+See [SECURITY.md](../SECURITY.md) for the deployment model.
 
-Current implementation choices, performance tradeoffs, and operator
-conventions are documented separately. They may change without
-changing the runtime model.
+## Platforms
 
-## Enforcement
+Linux 5.14 or later defines the supported process and transport behavior.
+Filesystem restrictions require Landlock ABI 3 or later, usually Linux 6.2 or later.
+A Linux start that requests Landlock must fail if that restriction cannot be installed.
 
-- Code review prevents intentional drift.
-- Executable tests enforce a subset of invariants; see "Required
-  tests" at the bottom of this file.
-- Inline comments mark the relevant call sites.
-- Where no test exists, the invariant is stated here but not verified
-  at build time.
+macOS is for development.
+Its fallback paths do not establish Linux security guarantees.
 
-## Platform scope
+## Message transport
 
-### Hard
+- Linux application channels use `AF_UNIX` `SOCK_SEQPACKET`.
+- One send operation produces one message.
+- A receiver rejects `MSG_TRUNC` and `MSG_CTRUNC`. It discards the frame and closes the connection.
+- Linux descriptor receives use `MSG_CMSG_CLOEXEC`.
+- A received descriptor must be close-on-exec before application code receives it.
+- A rejected receive closes all descriptors installed by that receive.
+- A successful `ipc_recv` transfers descriptor ownership to its caller.
+- `read_message` closes ancillary descriptors because its interface cannot return them.
+- Socket creation uses `SOCK_CLOEXEC` where available. Otherwise, code sets `FD_CLOEXEC` before exposing the descriptor.
+- Headers are ASCII. The payload is byte data and is not interpreted by the transport.
+- Duplicate known headers and malformed length values are protocol errors.
+- Parsers must reject overlong recognized fields instead of silently truncating them.
+- The broker does not maintain an application message queue. Kernel socket buffers provide message storage.
 
-- Linux ≥ 5.14 defines production semantics. Every guarantee stated
-  elsewhere in this document applies on Linux.
-- macOS is development-only. macOS behavior must not define or
-  constrain any capability, lifecycle, IPC, or security guarantee.
+The overlong-field requirement is not met by every legacy C wrapper.
+Applications must validate field values before use.
 
-Following sections do not repeat macOS caveats. Where a Linux
-primitive (`SOCK_SEQPACKET`, `pidfd`, `cgroup.kill`,
-`MSG_CMSG_CLOEXEC`, `SCM_RIGHTS`, Landlock, seccomp-bpf) is
-unavailable on Darwin, the code uses a fallback path; that path is
-not a production guarantee.
+Application receive buffers allow up to `IPC_MAX_FDS` descriptors.
+The broker request handler uses its own four-descriptor receive buffer.
 
-## IPC
+Send retries are bounded by `IPC_SEND_RETRIES`.
+The configured delays are 1, 5 and 25 milliseconds.
+The caller receives an error when retries are exhausted.
 
-### Hard invariants
+Callers must close descriptors they do not use.
+Close-on-exec does not prevent descriptor inheritance through `fork`.
 
-- The transport is `AF_UNIX` `SOCK_SEQPACKET`. One `sendmsg` is one
-  logical message; one `recvmsg` is one logical message.
-- `MSG_TRUNC` on `recvmsg` is fatal. The receiver closes the
-  connection, discards the frame, and writes an audit line. The
-  oversized frame is never delivered to application code.
-- `MSG_CTRUNC` on `recvmsg` is fatal. The receiver closes the
-  connection, discards the frame, and writes an audit line. Any
-  fds dropped by the kernel during the cmsg truncation are gone.
-- Every `recvmsg` allocates `CMSG_SPACE(sizeof(int) * IPC_MAX_FDS)`
-  for ancillary data.
-- Every `recvmsg` passes `MSG_CMSG_CLOEXEC`. Received fds are
-  `O_CLOEXEC` at the syscall boundary.
-- Every AF_UNIX socket creation uses `SOCK_CLOEXEC` where the
-  platform supports it; otherwise `FD_CLOEXEC` is set via `fcntl`
-  before any caller can see the fd.
-- The header is ASCII; the payload is opaque bytes. The transport
-  never inspects payload.
-- Duplicate known headers and malformed numeric length fields are protocol
-  violations. Parsers never silently truncate recognized field values.
-- No transport-layer userspace buffering. The kernel socket buffer
-  is the only queue. There is no sender-side accumulator, no
-  application ring buffer, no batching layer.
+## Supervised processes
 
-### Conventions
+Use a pidfd to identify a live supervised task on Linux.
+Use `pidfd_send_signal` when that handle is available.
+PID and process-group operations remain fallback paths.
 
-- Senders use `MSG_DONTWAIT` with bounded retry (3 attempts,
-  exponential backoff at 1/5/25 ms), then surface `EAGAIN` to the
-  caller. The retry parameters are an implementation choice.
-- Callers of `ipc_recv` must close any fds returned in `msg->fds[]`
-  they do not intend to consume. The transport does not own
-  received-fd lifecycle after delivery.
+The supervisor holds at most one pidfd per managed process.
+When it waits for its own child to exit, it must reap available zombies.
+A signal-zero check alone can treat a zombie as a live process.
 
-## Lifecycle
+Use an owned `cgroup.kill` descriptor for atomic subtree termination when available.
+The supervisor opens this handle in the parent.
+Cleanup must not obtain cgroup authority from `runtime/enforcement.applied`.
 
-### Hard invariants
+Without an owned cgroup, cleanup uses the process group.
+A child that creates another session can survive that fallback.
 
-- `pidfd` is the production lifecycle identity for supervised
-  processes on Linux. Code that signals, polls liveness, or
-  reaps for supervisory purposes uses pidfd.
-- `pidfd_send_signal` is the only sanctioned signal mechanism in
-  production code paths.
-- `cgroup.kill` is the only sanctioned mechanism for atomic SIGKILL
-  of an entire process subtree when the profile holds cgroup
-  ownership.
-- Code that busy-waits on a supervised own-child's exit must reap
-  inline (`waitpid(..., WNOHANG)`). Without inline reaping, zombies
-  satisfy any signal-0 liveness probe and the wait loop spins until
-  timeout.
-- `agentd` holds at most one pidfd per supervised process.
-- PID is display and recovery metadata. The integer pid is used to
-  populate `pid` files for `psa`/`inspect` and to seed `pidfd_open`
-  during recovery. It is not the runtime authority for lifecycle
-  decisions.
+After a leader exits, the supervisor attempts descendant cleanup before clearing its live process state.
+This does not guarantee cleanup of children outside its cgroup or process group.
 
-### Conventions
+### Process identity limits
 
-- `pidfd_open(pid, 0)` after `fork()` has a race window in the
-  microsecond range. v1 accepts this; `clone3(CLONE_PIDFD)` is the
-  strict-mode upgrade, not currently used.
-- External (recovered) processes are observed via `pidfd_open(pid)`
-  after reading the `pid` file at agentd startup. The same race
-  window applies. If the pid was reused before agentd's recovery
-  scan reads the file, agentd attaches to the wrong process; this is
-  a documented limit, not a defended invariant.
+The implementation opens a pidfd after `fork`.
+It does not use `clone3(CLONE_PIDFD)`.
 
-## Authority
+Recovery reads a stored PID before opening a pidfd.
+The PID can be changed or reused before that open.
+A pidfd does not validate the PID file from which its number came.
 
-### Hard invariants
+Direct mode also uses stored PIDs.
+Do not treat these recovery and direct-mode paths as equivalent to live supervisor-held process identity.
 
-- Broker-mediated authority is represented only by open file
-  descriptors. Strings, policy lines, names, agent identifiers,
-  and task metadata are not authority.
-- `agentd` is the sole broker. Authority is never synthesized by a
-  supervised process. The per-agent broker channel at fd 3 is the
-  only path to first-issuance.
-- The broker is default-deny. An empty policy file, or a policy file
-  that does not match the requested capability name, yields a
-  `denied` response with no fd.
-- The broker does not buffer, store, retry, or replay application
-  messages. It transfers fds and writes audit lines.
-- Every issuance writes an audit line to `agentd.log` and to the
-  requesting agent's `audit.log` carrying the same 8-character hex
-  correlation token.
+### Restart policy
 
-### Limits
+Restart delays start at one second and increase to a maximum of 30 seconds.
+Five consecutive runs shorter than 30 seconds set `crash-loop`.
+The desired state becomes `stopped`.
+An explicit operator start clears restart suppression.
 
-Do not assume the above invariants extend beyond these limits:
+## Capability broker
 
-- Same-uid adversaries are out of scope. Supervised agents have no pathname
-  listeners, but same-UID `ptrace`, `/proc` inspection, signals, and fd
-  forwarding can still cross the boundary.
-- `ptrace`, `SCM_RIGHTS` forwarding within an application, and
-  `fork` without `O_CLOEXEC` discipline can move fds between
-  processes that share a uid. The broker has no kernel-level
-  mechanism to prevent this.
-- Once delivered, an fd cannot be reclaimed from a peer's fd table.
-  agentd retains no copy after delivery, so revocation requires the operator
-  to restart the holding process.
-  Filesystem-anchored capabilities, when added, will have weaker
-  revocation: existing open fds keep working until the holder
-  closes them.
-- The receiver obtains authenticated requester metadata from agentd beside
-  the delivered fd. `REPLY-TO` remains routing metadata, not identity.
-- A broker request and its fd-bearing response are one critical section.
-  Threads and forked descendants sharing fd 3 serialize the full exchange
-  through inherited fd 5; atomic request writes alone are insufficient.
-- Receiver capability delivery uses a datagram socketpair so consecutive
-  `SCM_RIGHTS` deliveries retain boundaries on Linux and macOS.
-- Restart backoff is exponential from 1 second and capped at 30 seconds.
-  Five runs shorter than 30 seconds enter `crash-loop`, set desired state to
-  `stopped`, and require an explicit operator start.
+An open descriptor permits use of its channel.
+Names, policy entries and task metadata do not provide that access.
 
-### Conventions
+`agentd` is the broker for supervised agents.
+Descriptor 3 is the private request channel.
+An empty or nonmatching policy denies the request without a descriptor.
 
-- `mailbox.send:<agent>` capabilities are used short-lived in
-  v1: request, send, close. This is a convention enforced by
-  application code and SDK documentation, not by the broker or the
-  kernel. The broker does not impose a TTL.
+The broker transfers application endpoints and writes audit records.
+It does not buffer, retry or replay application messages.
+It retains no application endpoint after transfer.
 
-## Audit
+Inbox delivery and broker replies use nonblocking sends.
+A full inbox returns `target-busy`.
+An unread broker reply channel is shut down.
+Neither case may block the supervisor's event loop.
 
-### Hard invariants
+Rejected broker requests close received descriptors, including those installed before descriptor truncation was reported.
 
-- `agentctl` and `agentd` never rewrite existing audit lines in place
-  during normal operation. Lines are appended with `O_WRONLY |
-  O_CREAT | O_APPEND` on each open.
-- Audit lines are line-oriented ASCII: an RFC3339 UTC timestamp,
-  `pid=<n>`, then free-form text, terminated by `\n`.
-- Each broker issuance is recorded in `agentd.log` and in the
-  requesting agent's `audit.log` with the same 8-character hex
-  correlation token.
+A request and its descriptor-bearing response form one serialized exchange.
+Threads and forked children share descriptor 3.
+They must hold the process-local lock and the record lock on inherited descriptor 5 for the complete exchange.
 
-### Notes
+Incoming channels use a datagram socket pair on descriptor 4.
+Each delivery contains one endpoint and requester metadata.
+Datagram boundaries prevent adjacent descriptor deliveries from being combined.
 
-- External rotation, truncation, or deletion of audit files is
-  outside the runtime's guarantee. The runtime does not detect or
-  recover from external mutation.
-- The audit log is not tamper-evident. There is no cryptographic
-  signing, no hash chaining, no external integrity check. A process
-  with write access to the audit file can modify or remove lines.
-- The correlation token is 32 bits drawn from `/dev/urandom`. It is
-  sized for human correlation in single-host logs, not for
-  adversarial unguessability.
+`REPLY-TO` is routing metadata.
+It is not authenticated sender identity.
+See [capability broker](capabilities.md) for the requester metadata and its limits.
 
-## State tree
+### Capability limits
 
-### Hard invariants
+Same-user hostile processes are outside the isolation model.
+The broker does not prevent `ptrace`, signals, `/proc` access or descriptor forwarding.
 
-- The data root is per-user, resolved by `common.c::agentctl_root()`
-  in order: `AGENTCTL_ROOT` env override → `$XDG_RUNTIME_DIR/agentctl`
-  → `/tmp/agentctl-<uid>`. The root is created 0700 on first use.
-- `agentctl_root()` validates ownership and permissions on first
-  resolution: `st.st_uid == geteuid()` AND `(st.st_mode & 0077) == 0`.
-  A binary that resolves to a foreign-owned or world/group-readable
-  root MUST refuse to proceed (`exit(1)` with a stderr message). No
-  escape hatch.
-- `agentd` holds an exclusive advisory lock
-  (`flock(LOCK_EX | LOCK_NB)` on `<root>/agentd.lock`) for its
-  entire lifetime. A second `agentd` under the same data root MUST
-  observe `EWOULDBLOCK` and refuse to start. The kernel releases
-  the lock on any exit (including SIGKILL/OOM); successors can
-  acquire it immediately after a crash.
-- The agent directory `agentctl_root()/agents/<name>/` is split by owner:
-  `config/` contains operator/supervisor inputs, `runtime/` contains status
-  metadata, and `data/` is the child runtime's working and writable directory.
-  Compatibility symlinks expose legacy top-level names to operator tools, but
-  confined children are not granted access to the parent directory.
-- Runtime authority and liveness live in `agentd`'s memory and the
-  pidfds it holds. Files under `agents/<name>/` are a persisted
-  projection of supervisor state, not the source of truth for any
-  in-flight decision.
+A delivered descriptor cannot be revoked by the broker.
+Close every copy or stop every process that retains one.
+Deleting a filesystem pathname does not invalidate an open descriptor.
 
-### Live-input files
+The normal application sequence is request, send, close.
+There is no enforced expiry time.
 
-These files are read by the runtime during normal operation. Edits
-take effect on the next runtime read:
+## Control requests
 
-- `config/policy` — broker reads on every issuance request.
-- `config/desired_state`, `config/enabled` — agentd reads on inotify events and
-  during the periodic reconcile scan.
-- `config/exec` — agentd reads when reconciling a `desired_state=running`
-  entry that is not currently spawned.
+Partial requests use nonblocking reads.
+Each pending request has a 1024-byte buffer and a five-second total deadline.
+At most 64 requests can be pending.
+A partial unauthenticated request must not block other supervisor events.
 
-### Display artifacts
+The daemon validates the control token at startup and retains it in memory.
+Empty or malformed stored tokens prevent startup.
+Later file changes do not change the running daemon's accepted token.
 
-- `runtime/pid` — last pid as written by the supervisor; used by `psa` and
-  `agentctl inspect`. Not authoritative.
-- `runtime/status` — symbolic state word as last written by the runtime; used
-  by display tools. Not authoritative.
+## Profile restrictions and limits
 
-### Notes
+Explicit start overrides are written to `config/enforcement.overrides` before the running state is requested.
+Restarts retain them.
+A start without an override restores that field's profile default.
 
-- The broker reading `policy` on every request is an implementation
-  choice. A cache with correct invalidation against operator edits
-  is permitted; the current code does not implement one.
+With cgroup enforcement enabled, configured memory, PID and CPU limits are startup requirements.
+Invalid CPU quota syntax or a failed limit write prevents runtime creation.
+The applied state records cgroup enforcement as unavailable.
 
-## Required tests
+Without configured limits, an unavailable cgroup hierarchy retains the process-group fallback.
+Cgroup attachment occurs after `fork`, without a child startup barrier.
+The child can execute or fork before attachment.
 
-The QEMU integration test (`kernel/dev/share/agentfs-test.sh`) and the
-userspace suite under `tests/` cover the invariants listed below.
+The minimal seccomp filter permits runtime execution and libc startup calls.
+It is not an exec-once policy.
+Linux Landlock installation, seccomp installation and exec failures must be returned as start failures.
 
-| Invariant | Covered? |
+## Audit records
+
+Normal operation appends audit lines with `O_WRONLY | O_CREAT | O_APPEND`.
+It does not rewrite earlier lines.
+
+Each line contains an RFC3339 UTC timestamp, `pid=<n>` and text, followed by a newline.
+Each approved capability request records the same eight-character hexadecimal value in both logs:
+
+- `agentd.log`
+- The requesting agent's `audit.log`
+
+The value contains 32 random bits from `/dev/urandom`.
+It is for log correlation, not authentication.
+
+Audit files have no cryptographic integrity protection.
+A process with write access can change or delete them.
+External rotation and truncation are not detected or repaired by the runtime.
+
+## State directories
+
+The state root is selected in this order:
+
+1. `AGENTCTL_ROOT`.
+2. `$XDG_RUNTIME_DIR/agentctl`.
+3. `/tmp/agentctl-<uid>`.
+
+The root is created with mode `0700`.
+Its owner must match the effective user ID.
+Group and other permission bits must be zero.
+A failed owner or permission check terminates the program with an error.
+
+`agentd` holds `flock(LOCK_EX | LOCK_NB)` on `agentd.lock` until exit.
+A second daemon under the same root must refuse startup.
+The kernel releases the lock after any process exit, including `SIGKILL` and an out-of-memory kill.
+
+Each `agents/<name>/` directory has these subdirectories:
+
+| Directory | Purpose |
 |---|---|
-| `MSG_TRUNC` causes `ipc_recv` to return `IPC_PROTO_VIOLATION` | Covered: `tests/test_ipc_msg_trunc.c` (socketpair unit test) |
-| `MSG_CTRUNC` causes `ipc_recv` to return `IPC_PROTO_VIOLATION` | Covered: `tests/test_ipc_msg_ctrunc.c` (socketpair unit test) |
-| Received fds have `FD_CLOEXEC` set | Covered: `tests/test_cloexec.c` (socketpair unit test) |
-| Path components and broker fields fail closed instead of traversing or truncating | Covered: `tests/test_input_validation.c` |
-| Broker default-deny: empty policy → no issuance | Covered: `tests/broker_default_deny.sh` |
-| Wildcard policy grants matching caps | Covered: `tests/broker_wildcard.sh` |
-| Malformed broker request denied; channel remains open | Covered: `tests/broker_malformed.sh` (uses `broker-fault` in `malformed` mode) |
-| `MSG_CTRUNC` on the broker channel closes it | Covered: `tests/broker_msg_ctrunc.sh` (uses `broker-fault` in `many-fds` mode) |
-| Policy file alone does not pre-materialize authority | Covered: `tests/policy_not_authority.sh` (uses `broker-fault` in `fdtable` mode) |
-| Broker does not retain per-issuance state (no growing fd table) | Covered: `tests/broker_no_state.sh` (agentd fd count stable across 5 issuances) |
-| Audit token appears in both `agentd.log` and the requester's `audit.log` | Covered: F4 step in `agentfs-test.sh` |
-| Zombie stop path reaps inline; SIGTERM-clean stops do not escalate | Covered: F step in `agentfs-test.sh` (stop ~60 ms) |
-| `cgroup.kill` terminates the subtree when cgroup ownership exists | Covered: F3 step in `agentfs-test.sh` |
-| Foreign-owned or world-readable data root is refused | Covered: `tests/agentctl_foreign_root.sh` (permission half always-on; uid half sudo-gated) |
-| Second `agentd` under the same data root refuses to start | Covered: `tests/agentd_single_instance.sh` |
-| Lockfile is released on SIGKILL | Covered: `tests/agentd_lockfile_kill9.sh` |
+| `config/` | Operator and supervisor inputs. |
+| `runtime/` | Status and process metadata. |
+| `data/` | Runtime working directory and application files. |
 
-Run all of the above via `tests/run-all.sh` (with `agentd` running for
-the broker tests) or as Step H of the QEMU integration test.
+Compatibility symlinks expose older top-level paths.
+The normal Landlock profile does not grant the child access to that parent directory.
+Migration must not move a compatibility symlink into its own target.
 
-## Change procedure
+Live supervisor state uses in-memory records and open process handles.
+Files used for display are not a substitute for those records.
+Recovery and direct-mode PID reads remain exceptions with the limits stated above.
 
-To change an invariant: update this file first, then change the code.
+### Inputs read during operation
+
+| File | Read point |
+|---|---|
+| `config/policy` | Each broker request. |
+| `config/desired_state` | Relevant inotify events and periodic reconciliation. |
+| `config/enabled` | Relevant inotify events and periodic reconciliation. |
+| `config/exec` | Reconciliation when the desired state is running and no runtime is active. |
+
+There is no policy cache.
+Changing policy affects later requests, not descriptors already delivered.
+
+### Display files
+
+`runtime/pid` records the last stored PID.
+`runtime/status` records a symbolic process state.
+Display tools use these files.
+They do not establish live process identity.
+
+## Tests
+
+| Requirement | Test |
+|---|---|
+| Reject payload truncation | `tests/test_ipc_msg_trunc.c` |
+| Reject descriptor truncation | `tests/test_ipc_msg_ctrunc.c` |
+| Close descriptors on receive errors | `tests/test_ipc_fd_cleanup.c` |
+| Set close-on-exec on received descriptors | `tests/test_cloexec.c` |
+| Validate path components, broker fields, CPU quotas and profile defaults | `tests/test_input_validation.c` |
+| Deny requests without policy permission | `tests/broker_default_deny.sh` |
+| Match wildcard policy entries | `tests/broker_wildcard.sh` |
+| Serialize concurrent broker requests | `tests/broker_concurrency.sh` |
+| Deny malformed requests without closing a valid channel | `tests/broker_malformed.sh` |
+| Close a truncated broker channel | `tests/broker_msg_ctrunc.sh` |
+| Do not create descriptors from policy entries alone | `tests/policy_not_authority.sh` |
+| Keep the broker descriptor count stable | `tests/broker_no_state.sh` |
+| Refuse an unsafe state root | `tests/agentctl_foreign_root.sh` |
+| Refuse a second daemon | `tests/agentd_single_instance.sh` |
+| Release the daemon lock after SIGKILL | `tests/agentd_lockfile_kill9.sh` |
+| Reject unauthorized control and configuration changes | `tests/phase1_authority_boundary.sh` |
+| Suppress a repeated crash loop | `tests/restart_crash_loop.sh` |
+| Check supervisor and Python SDK regressions | `tests/runtime_regressions.py` |
+| Reject failed configured cgroup limits in a delegated VM | `tests/cgroup_quotas.sh` |
+
+Run `tests/run-all.sh` with a daemon for the broker tests.
+The cgroup quota script needs a separate disposable VM.
+Some cross-user checks require sudo.
+
+The generated `kernel/dev/share/agentfs-test.sh` has additional QEMU scenarios when present.
+Earlier scenarios F, F3 and F4 checked zombie cleanup, subtree termination and audit correlation.
+These scenarios are not all run by the userspace suite.
+See [test instructions](../tests/README.md).
+
+## Changes to requirements
+
+Update this document before changing a design requirement.
+Change the implementation and regression tests with the requirement.

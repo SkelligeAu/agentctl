@@ -6,6 +6,7 @@ fanout-agent
 psa
 broker-test
 broker-fault
+broker-concurrency
 
 # ─── object files / archives ─────────────────────────────────────────
 *.o
@@ -16,7 +17,12 @@ broker-fault
 # ─── compiled test binaries (sources stay) ──────────────────────────
 tests/test_ipc_msg_trunc
 tests/test_ipc_msg_ctrunc
+tests/test_ipc_fd_cleanup
 tests/test_cloexec
+tests/test_input_validation
+tests/phase1-probe
+tests/crash-agent
+tests/runtime-regression
 
 # ─── compiled bench binary (source stays) ───────────────────────────
 bench/bench-pingpong

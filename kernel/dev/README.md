@@ -1,259 +1,291 @@
-# Kernel-module development environment
+# Kernel development and QEMU tests
 
-> **Why this exists.** Building and testing kernel modules without
-> trashing the host requires (a) a build environment with the right
-> toolchain, (b) a kernel source tree to build against, (c) a VM you can
-> safely crash. This directory gives you all three in one `make qemu`.
->
-> **Docker is *only* for building.** The container holds the toolchain,
-> the kernel source, the helpers. Module loading happens inside a QEMU VM
-> that runs *inside* the container (or on the host if you'd rather).
-> Loading custom kernel modules in a container is a category error — the
-> container shares the *host's* kernel and you'd be modifying it.
+Docker provides the build tools.
+QEMU runs the test kernel and module in a guest VM.
 
-## What's here
+Do not run `insmod` inside the Docker container.
+The container shares its host's kernel.
+Use the QEMU guest for module loading and crash tests.
 
-```
+The `agentfs` module is research code.
+See [research status](../../docs/research.md).
+
+## Files
+
+```text
 kernel/dev/
-  Dockerfile             ──  build/dev image (Ubuntu 24.04 + toolchain + QEMU + busybox)
-  docker-compose.yml     ──  optional, mirrors the Makefile's `make shell`
-  Makefile               ──  high-level workflow targets (image / kernel / qemu / gdb)
-  README.md              ──  this file
-  .clangd                ──  LSP config for editing kernel headers
-  .gitignore             ──  excludes src/, share/, build artefacts
-
+  Dockerfile
+  docker-compose.yml
+  Makefile
+  .clangd
   bin/
-    fetch-kernel.sh      ──  curl + tar a kernel.org release
-    build-kernel.sh      ──  configure + build bzImage + modules_prepare
-    build-rootfs.sh      ──  pack a busybox initramfs
-    qemu-run.sh          ──  launch QEMU with 9p sharing /work into /mnt/share
-
+    fetch-kernel.sh
+    build-kernel.sh
+    build-rootfs.sh
+    qemu-run.sh
   qemu/
-    kernel.config        ──  config fragment merged onto x86_64 defconfig
-    init.sh              ──  PID 1 inside the VM; mounts 9p, drops to shell
-
-  examples/hello/        ──  canonical hello-world module (build pipeline smoke test)
-
-  src/                   ──  generated: linux-X.Y.Z/ kernel source (gitignored)
-  share/                 ──  generated: vmlinuz, initramfs.cpio.gz, *.ko (gitignored)
+    kernel.config
+    init.sh
+  examples/hello/
+  src/
+  share/
 ```
 
-The directory layout mirrors how a kernel developer actually works:
-**`src/` = source you don't own**, **`share/` = build output**, **`bin/` =
-the muscle memory commands**, **`qemu/` = config that follows the
-project**. Nothing is hidden behind abstractions you can't grep.
+`src/` contains downloaded kernel source and build output.
+`share/` contains the guest kernel, initramfs and copied test files.
+These directories contain generated files and are excluded from version control.
 
-## End-to-end demo
+The Makefile mounts the repository at `/work` in the container.
+The standard QEMU command exposes `share/` as writable `/mnt/share` in the guest.
+Guest writes there change the host's `kernel/dev/share/` directory.
+This configuration is not a VM with no host filesystem access.
 
-Fresh checkout, macOS or Linux host, Docker installed:
+## Build the test environment
 
+From a checkout with Docker available:
+
+```sh
+cd kernel/dev
+make image
+make fetch-kernel
+make kernel
+make rootfs
+make module
+make hello
+make qemu
 ```
-cd kernel/dev/
-make image              # ~3 min   build the container image
-make fetch-kernel       # ~30 s    download linux-6.6.32.tar.xz, extract
-make kernel             # ~5-15 min  configure + build (ccache helps reruns)
-make rootfs             # ~2 s     pack busybox initramfs
-make module             # ~10 s    build /work/kernel/agentfs.ko
-make hello              # ~5 s     build the hello-world example
-make qemu               # boots the VM, drops you to a shell
+
+The default kernel version is 6.6.32.
+Use `KERNEL_VERSION` to select another version.
+
+The kernel script builds the host architecture.
+ARM64 uses the `Image` target.
+x86-64 uses `bzImage`.
+Both are copied to `share/vmlinuz`.
+
+The root filesystem script packs an Alpine minirootfs as `share/initramfs.cpio.gz`.
+Its `/init` mounts proc, sysfs, device files, temporary storage, cgroup v2 and the 9p share.
+
+If an executable `share/agentfs-test.sh` exists, the guest runs it and powers off.
+Otherwise, it opens a shell.
+Use this target to request a shell explicitly:
+
+```sh
+make qemu-shell
 ```
 
-Inside the VM:
+## Load the modules in the guest
 
-```
-# Smoke test the pipeline first:
+Check the hello module first:
+
+```sh
 insmod /mnt/share/hello.ko
 dmesg | tail -3
-# hello: loaded
 rmmod hello
+```
 
-# Then the real thing:
+Load agentfs and mount it:
+
+```sh
 insmod /mnt/share/agentfs.ko
 mkdir -p /mnt/agentfs
 mount -t agentfs none /mnt/agentfs
 ls /mnt/agentfs
-# agents/  register
-
-# Register an agent (we don't have agentfs-register inside busybox; use the
-# kernel-facing interface directly):
-echo reviewer > /mnt/agentfs/register
-ls /mnt/agentfs/agents/reviewer
-# inbox  outbox  owner  pid  stats  status
-cat /mnt/agentfs/agents/reviewer/pid
-cat /mnt/agentfs/agents/reviewer/status
-echo "hello" > /mnt/agentfs/agents/reviewer/inbox
-cat /mnt/agentfs/agents/reviewer/inbox
-
-poweroff -f             # or Ctrl-A, x
 ```
 
-## How the pieces talk
+The filesystem contains `agents/` and `register`.
+Use the registration helper to keep an owner task alive.
+A short-lived `echo` command does not create a persistent owner.
 
-```
-  host                                  container (kdev)
-  ─────                                 ─────────────────
-  Docker Desktop / Linux ──── kernel/ ──┬──→ /work        (bind mount, r/w)
-                                        │
-                                        ├──→ src/         kernel source
-                                        ├──→ share/       vmlinuz, *.ko, initramfs
-                                        │
-                                        │   ┌────────────────────── QEMU ────────────┐
-                                        │   │  guest kernel = share/vmlinuz          │
-                                        │   │  initramfs    = share/initramfs.cpio.gz│
-                                        │   │  -virtfs share=path=share/             │
-                                        │   │     ▶ guest mounts as /mnt/share       │
-                                        │   │       (9p over virtio)                 │
-                                        └─→ │       guest insmod /mnt/share/*.ko     │
-                                            └────────────────────────────────────────┘
+Build and copy the helpers before using them in the guest:
+
+```sh
+# On the host, from kernel/dev:
+make helpers
+
+# In the guest:
+/mnt/share/agentfs-register reviewer &
+printf 'hello\n' | /mnt/share/agentfs-send reviewer
+/mnt/share/agentfs-read reviewer
 ```
 
-`/mnt/share` inside the VM **is** the host's `kernel/dev/share/` directory.
-Drop a `.ko` into `share/` on the host, it's instantly available to the
-VM. Edit `kernel/agentfs.c`, run `make module`, the new `agentfs.ko`
-appears.
+The send helper reads standard input.
+Use another terminal or a pipe when testing a blocked reader.
+See [module instructions](../README.md) for a complete message example.
 
-## Why each component
+Exit the guest with:
 
-| Piece | Why |
+```sh
+poweroff -f
+```
+
+Ctrl-A, then x also exits QEMU.
+
+## Build the userspace supervisor
+
+```sh
+make userland
+```
+
+This target performs a clean static Linux build in the mounted repository.
+It replaces host build outputs with Linux executables.
+Rebuild with the host compiler before using those binaries on macOS.
+
+The target copies selected programs, profiles and tests into `share/userland/`.
+Check that all programs required by the selected guest test are present.
+The target does not install every current test dependency.
+In particular, the Python integration tests need Python in the guest.
+
+See [test instructions](../../tests/README.md).
+
+## Build tools
+
+| Tools | Purpose |
 |---|---|
-| **Ubuntu 24.04 base** | Modern enough that `make defconfig` + recent kernels just build. Debian Bookworm works equally well; swap the `FROM` line. |
-| **gcc + clang + lld** | The kernel still defaults to gcc but parts (and increasingly all of it) build with clang. Having both lets you flip with `CC=clang LLVM=1`. |
-| **bc / bison / flex** | Required by the kernel's build for `Kbuild` parsing, kconfig, and timeconst.bc. The kernel build will fail in confusing ways without them. |
-| **libssl-dev / libelf-dev** | `libssl` for signing-related tooling; `libelf` for `pahole` + module loading. |
-| **dwarves (`pahole`)** | Generates BTF info (`CONFIG_DEBUG_INFO_BTF`). Needed for any BPF work and for some recent kernel features. |
-| **kmod** | `insmod`/`modprobe`/`depmod` for working with `.ko` files outside the VM if you need to. |
-| **cpio / rsync** | Initramfs packing (cpio) and source-tree copying without surprises (rsync). |
-| **qemu-system-x86 / qemu-utils** | The kernel runs here. Anything that goes wrong crashes the VM, not your host. |
-| **busybox-static** | Tiny single-binary userland for the initramfs. We just symlink commands at it. |
-| **ccache** | Kernels rebuild a lot. ccache turns a 10-minute incremental build into 30 seconds. The Dockerfile prepends `/usr/lib/ccache` to PATH so plain `gcc` becomes the cached variant. |
-| **bear** | Generates `compile_commands.json` by intercepting compiler invocations. Required for clangd to understand kernel sources. |
-| **gdb** | The host-side gdb attaches to QEMU on `:1234` and reads `vmlinux` for symbols. See "Debugging" below. |
+| GCC, Clang and LLD | Compile and link kernel and userspace code. |
+| bc, Bison and Flex | Kernel configuration and generated build files. |
+| libssl-dev and libelf-dev | Headers and libraries required by kernel build tools. |
+| dwarves and pahole | BTF generation when enabled in the kernel configuration. |
+| kmod | Module inspection and loading tools. Load test modules only in the guest. |
+| cpio and rsync | Initramfs packing and file copying. |
+| QEMU | Run x86-64 or ARM64 guests. |
+| busybox-static | A small userspace utility binary available in the build image. |
+| ccache | Reuse compiler results between builds. |
+| bear | Record compiler commands for clangd. |
+| GDB | Debug the guest kernel through QEMU. |
 
-## Editor support (clangd / VSCode / Neovim)
+The image uses Ubuntu 24.04.
+It creates a development user with the host UID and GID supplied by `make image`.
+The ccache directory is `kernel/dev/.ccache`.
+Use `ccache -s` inside the container to inspect cache use.
 
-1. After `make kernel`, run `make compile-db`. This re-runs the module
-   build under `bear`, producing `kernel/compile_commands.json`.
-2. Open `kernel/agentfs.c` in any clangd-capable editor (VSCode + the C/C++
-   extension, Neovim with `nvim-lspconfig` + `clangd`, Helix, Zed, …).
-3. The `kernel/dev/.clangd` file adds the kernel-build defines and strips
-   gcc-only flags clang doesn't recognise. Without it, every `#include`
-   looks broken.
+## Editor configuration
 
+After a kernel build, generate the compiler database:
+
+```sh
+make compile-db
 ```
-# typical neovim config snippet
+
+This runs the module build under `bear`.
+It writes `kernel/compile_commands.json`.
+
+Use a clangd-capable editor.
+`kernel/dev/.clangd` adds kernel build definitions and removes unsupported GCC options.
+
+Example Neovim configuration:
+
+```lua
 require'lspconfig'.clangd.setup{
   cmd = {"clangd", "--header-insertion=never"},
 }
 ```
 
-## Debugging — gdb attached to a paused VM
+## GDB through QEMU
 
+In terminal 1, from `kernel/dev`:
+
+```sh
+make gdb
 ```
-# terminal 1 (inside kernel/dev/)
-make gdb            # boots QEMU with -s -S, so it freezes at first instruction
 
-# terminal 2
-make gdb-attach     # connects gdb to :1234, loads src/linux-<ver>/vmlinux
-(gdb) b agentfs_init
-Breakpoint 1 at 0xffffffff...
+QEMU starts paused with its GDB endpoint on port 1234.
+
+In terminal 2, on x86-64:
+
+```sh
+make gdb-attach
+```
+
+The supplied attach target sets an x86-64 architecture.
+For ARM64, use an ARM64-capable GDB without that x86 setting:
+
+```sh
+gdb -ex 'target remote :1234' src/linux-6.6.32/vmlinux
+```
+
+Set a kernel breakpoint and continue:
+
+```text
+(gdb) b start_kernel
 (gdb) c
-Continuing.
-
-# back in terminal 1, the VM has booted; do this:
-insmod /mnt/share/agentfs.ko
-# gdb in terminal 2 hits the breakpoint
 ```
 
-**Why `nokaslr`?** Kernel address-space randomisation moves every kernel
-address each boot, so the symbols in `vmlinux` won't line up with where
-the code actually is. `qemu-run.sh` adds `nokaslr` to the command line by
-default. Remove it for production builds.
+Load `agentfs.ko` in the guest after it boots.
+Add the module symbols before setting breakpoints in its functions.
 
-**Module symbols** (for debugging `agentfs.ko` itself, not the kernel):
+For module symbols, obtain the text address in the guest:
 
+```sh
+cat /sys/module/agentfs/sections/.text
 ```
+
+Then load symbols in GDB:
+
+```text
 (gdb) add-symbol-file /work/kernel/agentfs.ko <load address>
 ```
 
-Get the load address from `cat /sys/module/agentfs/sections/.text` inside
-the VM after `insmod`.
+The QEMU script adds `nokaslr` to keep kernel addresses stable for debugging.
+Do not copy this debugging setting into a production kernel configuration.
 
-## Debugging — kgdb over serial (the heavy weapon)
+## Serial KGDB
 
-For kgdb you boot with `kgdbwait` in the command line; kernel waits for a
-gdb attach over the serial port before continuing init.
+Serial KGDB is an optional configuration.
+The normal `make gdb` target uses QEMU's GDB endpoint instead.
 
+For an x86 serial setup, add `kgdboc=ttyS1,115200 kgdbwait` to the guest kernel command line.
+Add a second serial port with `-serial pty` in `qemu-run.sh`.
+Use the PTY path printed by QEMU:
+
+```text
+(gdb) set serial baud 115200
+(gdb) target remote /dev/pts/3
 ```
-# edit qemu/init.sh append line to add:  kgdboc=ttyS1,115200 kgdbwait
-# add a second serial in qemu-run.sh:    -serial pty
-# QEMU prints something like  /dev/pts/3
-# then: gdb vmlinux ; (gdb) set serial baud 115200 ; (gdb) target remote /dev/pts/3
-```
 
-In practice for an LKM POC, attaching gdb to QEMU's gdbstub on `:1234` is
-much simpler than kgdb-over-serial — and that's what `make gdb` gives you.
-Reach for kgdb only when you're debugging early boot (before gdbstub is
-usable).
+The PTY path and serial device must match the actual configuration.
 
-## Performance — KVM vs TCG
+## Acceleration
 
-| Host | What runs | Speed |
-|---|---|---|
-| Linux with `/dev/kvm` exposed to the container | KVM (hardware virt) | native |
-| macOS via Docker Desktop | TCG (software emulation, no nested virt) | ~10-20× slower |
-| Linux without `/dev/kvm` (rare) | TCG | as above |
+QEMU uses software emulation by default.
+Pass `--kvm` to `bin/qemu-run.sh` to request KVM.
+The container must also have access to `/dev/kvm`.
+The standard Makefile does not expose that device automatically.
+The Compose file contains a commented device mapping.
 
-Pass `--kvm` to `bin/qemu-run.sh` (or set it in your own wrapper) to
-enable KVM where available. On macOS you can alternatively install QEMU
-via Homebrew on the host and run it there with `accel=hvf` for fast
-emulation — at the cost of moving QEMU outside the dev image.
+Without KVM, the script uses software emulation.
+Build and test times depend on the host and guest workload.
 
-## Common pitfalls
+## Real cgroup tests
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `insmod: ERROR: could not insert module ...: Invalid module format` | Module built against a different kernel version than the one QEMU is running | Always `make kernel` (or `make fetch-kernel kernel`) before `make module`. Module `vermagic` must match. |
-| `ld: cannot find -lelf` / `ld: cannot find -lssl` | Missing dev headers on a host build | Use the container. Or `apt install libelf-dev libssl-dev`. |
-| QEMU boots but you see nothing | No serial console kernel built / no `console=ttyS0` in cmdline | The provided `kernel.config` and `qemu-run.sh` cover both. If you modified them, check both still set the console to ttyS0. |
-| QEMU exits immediately with `init not found` | initramfs missing `/init` or it's not executable | `bin/build-rootfs.sh` chmods it; re-run `make rootfs` after editing `qemu/init.sh`. |
-| `mount: agentfs: unknown filesystem type` inside the VM | Tried to mount before `insmod` | `insmod` registers the type; then `mount -t agentfs`. |
-| `rmmod: ERROR: ... Resource temporarily unavailable` | Open files on the agentfs mount | `umount` first; reap any `agentfs-register` processes. |
-| gdb says "Remote 'g' packet reply is too long" | Mismatch between QEMU CPU type and gdb arch | Use `qemu64` (already default) and `set arch i386:x86-64:intel` in gdb. |
-| Files on host owned by root after Docker run | Image built with default UID, not yours | Rebuild: `make image` runs `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g)`. |
-| `bear` fails / `compile_commands.json` empty | Underlying `make` failed | Run `make module` standalone first; fix that, then `make compile-db`. |
-| 9p mount fails with `cannot open access=...` | host path doesn't exist or container can't see it | The Makefile mounts `kernel/dev/share/` — make sure it exists (it's created by `make rootfs`). |
-| Builds are dog slow even on rebuilds | ccache not picking up | `echo $PATH` inside the container should show `/usr/lib/ccache:...` first. `ccache -s` shows hit rate. |
+A writable cgroup v2 mount and delegated controllers are required.
+CPU quota tests also require `CONFIG_CFS_BANDWIDTH=y`.
+The supplied kernel fragment does not enable that setting explicitly.
+Check the resulting kernel configuration before running CPU quota tests.
 
-## Going further
+The guest administrator must create the delegated hierarchy.
+Run the supervisor and workloads as an unprivileged user within it.
+Do not use a writable host cgroup mount as a substitute for an isolated test guest.
 
-This setup intentionally stops at "build + test one module in one VM."
-Things you might add later, none of which I included to keep the surface
-small:
+See `tests/cgroup_quotas.sh` and the [test instructions](../../tests/README.md).
+Check the test's result marker, not only QEMU's exit code.
+A guest can report test failure and still power off normally.
 
-- **netboot for multi-machine tests** — TFTP/PXE inside docker-compose;
-  useful for testing module interactions across two VMs.
-- **Coccinelle / smatch / sparse** — static analysers the kernel devs
-  actually use. `apt install coccinelle sparse smatch`.
-- **lockdep / KASAN / KMSAN / UBSAN** — set in `qemu/kernel.config` for
-  the next kernel build. Slow but catches real bugs.
-- **GDB python scripts that ship with the kernel** — `make scripts_gdb`
-  generates `vmlinux-gdb.py`. `(gdb) source vmlinux-gdb.py` then
-  `(gdb) lx-dmesg`, `(gdb) lx-lsmod`, etc.
-- **A second module, vmtest-style** — building two modules and loading
-  them in dependency order. Just add another `obj-m` target.
-- **CI** — the same Dockerfile + `make module` works in any container
-  CI. The QEMU step is harder to put in CI (needs `/dev/kvm` for speed
-  or you pay TCG cost).
+## Common failures
 
-## What this is not
+| Symptom | Check |
+|---|---|
+| Invalid module format | Match the module build to the booted kernel and its `vermagic`. |
+| Missing `-lelf` or `-lssl` | Use the build image or install the matching development libraries. |
+| No console output | Check the kernel console and command line. x86 uses `ttyS0`; ARM64 uses `ttyAMA0`. |
+| Init not found | Rebuild the initramfs and confirm executable `/init` is present. |
+| Unknown agentfs filesystem | Load the module before mounting it. |
+| Module removal fails | Stop helpers, close files and unmount agentfs before `rmmod`. |
+| GDB register packet error | Match GDB's architecture to the QEMU guest. |
+| Host files become root-owned | Rebuild the image with the correct host UID and GID. |
+| Empty compiler database | Fix the module build before running `make compile-db`. |
+| 9p mount failure | Confirm `share/` exists and is visible to the container. |
+| Repeated slow builds | Check `/usr/lib/ccache` in PATH and inspect `ccache -s`. |
 
-- Not a Kubernetes-based test harness. Add one if you scale to hundreds
-  of kernels, not before.
-- Not a devcontainer. VSCode's devcontainer.json adds a layer of
-  indirection on top of the Dockerfile; you can wrap this in one
-  trivially if you want, but the indirection isn't needed.
-- Not a yocto / buildroot environment. We build an initramfs with
-  busybox-static because that's the smallest thing that boots. If you
-  need a real rootfs, swap `bin/build-rootfs.sh` for a `debootstrap` call.
-- Not a sandbox for *running* kernel modules. **Don't `insmod` anything
-  inside the container.** The container shares the host's kernel.
+Optional checks include sparse, smatch, Coccinelle, lockdep and kernel sanitizers.
+They are not automatically run by these targets.

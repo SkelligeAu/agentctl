@@ -27,6 +27,7 @@ run_one() {
 echo "== ipc unit tests =="
 run_one ipc_msg_trunc       "$HERE"/test_ipc_msg_trunc
 run_one ipc_msg_ctrunc      "$HERE"/test_ipc_msg_ctrunc
+run_one ipc_fd_cleanup      "$HERE"/test_ipc_fd_cleanup
 run_one cloexec_propagation "$HERE"/test_cloexec
 run_one input_validation   "$HERE"/test_input_validation
 
@@ -48,6 +49,9 @@ run_one phase1_authority_boundary sh "$HERE/phase1_authority_boundary.sh"
 
 echo "== lifecycle hardening tests =="
 run_one restart_crash_loop sh "$HERE/restart_crash_loop.sh"
+
+echo "== supervisor and Python SDK regressions =="
+run_one runtime_regressions python3 "$HERE/runtime_regressions.py"
 
 echo
 echo "results: pass=$pass fail=$fail skip=$skip"

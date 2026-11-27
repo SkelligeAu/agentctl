@@ -1,44 +1,40 @@
-# Multi-tenant deployment
+# Multiple-user deployment
 
-How to run agentctl on a shared host such that compromise of one
-tenant's supervised processes does not give access to another tenant's
-state.
+A tenant is a UNIX account that runs its own agentctl instance.
+Use a separate account for each user who must not access another user's state.
 
-The model is **one Unix uid per tenant** with an independent agentctl
-instance per uid. The kernel enforces isolation. agentctl provides
-two gates that make this safe: ownership validation on the data root
-and a `flock`-based single-daemon-per-root guarantee.
+UNIX permissions provide the account boundary.
+The agentctl root checks and daemon lock do not provide complete host isolation.
+Read [SECURITY.md](../SECURITY.md) before deployment.
 
-This document describes the operator-side setup. agentctl does **not**
-provision uids, configure `/proc`, manage cgroup delegation, or set up
-namespaces. Those are the operator's job, using standard system
-tooling.
+The host administrator must create accounts and configure process visibility, cgroups and network access.
+agentctl does not perform that setup.
 
-## Per-tenant uid creation
-
-One Unix uid per tenant. Plain `useradd`:
+## Create an account
 
 ```sh
 useradd -r -M -s /usr/sbin/nologin tenant-foo
 ```
 
-Tenants should not share any application group (`adm`, `wheel`,
-`docker`, etc.) — those bypass per-uid filesystem perms. If you
-delegate cgroup or `/proc` access to a group (see below), define a
-**separate** admin group and put only the operator in it.
+This command creates a system account without a home directory.
+Create and configure a home directory separately if you use systemd user units.
 
-## Per-tenant systemd user unit
+Do not grant tenant accounts access to privileged groups such as `docker`, `adm` or `wheel`.
+Do not use a shared group to expose tenant state directories.
+Keep any process-inspection administrator group separate from tenant accounts.
 
-agentd is a long-lived foreground daemon. Run it as a systemd user
-service so `loginctl enable-linger tenant-foo` materializes
-`/run/user/<uid>` (with the right perms) at boot and keeps the daemon
-running across logout.
+## Run the supervisor
+
+`agentd` runs in the foreground.
+A systemd user service can manage it.
+
+Enable lingering if the user service must run without a login session:
 
 ```sh
 loginctl enable-linger tenant-foo
 ```
 
-`~tenant-foo/.config/systemd/user/agentd.service`:
+Example user unit at `~tenant-foo/.config/systemd/user/agentd.service`:
 
 ```ini
 [Unit]
@@ -46,6 +42,7 @@ Description=agentctl supervisor
 
 [Service]
 ExecStart=/usr/local/bin/agentd
+Environment=AGENT_PROFILES_DIR=/etc/agentctl/profiles
 Restart=on-failure
 RestartSec=1s
 NoNewPrivileges=true
@@ -62,182 +59,172 @@ ProtectControlGroups=true
 WantedBy=default.target
 ```
 
-Notes:
+This is a service example, not a complete isolation configuration.
+Check the settings supported by the host's systemd installation.
 
-- `Restart=on-failure` is safe because agentctl uses `flock` for
-  single-instance enforcement. A crashed daemon's lock releases
-  immediately; the restart succeeds without a stale-PID race.
-- `PrivateTmp=true` means this tenant's `/tmp` is private, so the
-  fallback `/tmp/agentctl-<uid>` path (used when `$XDG_RUNTIME_DIR`
-  is unset) is also tenant-private. Under linger, `$XDG_RUNTIME_DIR`
-  is set, so the data root is `/run/user/<uid>/agentctl/` —
-  per-uid, 0700 owned by the tenant, and wiped on session teardown.
-- `ProtectSystem=strict` + `ProtectHome=tmpfs` reduce the blast radius
-  of any agentctl bug.
+`ProtectControlGroups=true` prevents cgroup writes.
+Do not use this setting when the service must configure resource limits.
+Removing it alone does not establish safe cgroup delegation.
 
-Enable + start:
+Start the service after installing the unit:
 
 ```sh
 sudo -u tenant-foo XDG_RUNTIME_DIR=/run/user/$(id -u tenant-foo) \
     systemctl --user enable --now agentd.service
 ```
 
-## `/proc` hardening
+The daemon lock prevents a second instance under the same state root.
+The kernel releases the lock after daemon exit.
+Recovery of already running agents has separate identity limits.
+See [process control limits](../SECURITY.md#process-control-limits).
 
-By default `/proc` shows every process to every user, leaking
-`/proc/<pid>/cmdline`, `/proc/<pid>/environ` (often), and
-`/proc/<pid>/maps` (always for same-uid). Mount with `hidepid=2`:
+With `XDG_RUNTIME_DIR` set, the root is normally `/run/user/<uid>/agentctl`.
+Without it, the fallback is `/tmp/agentctl-<uid>`.
+`PrivateTmp=true` gives the service a private temporary directory.
+Operator tools must use the same visible state root as the daemon.
 
-```
+## Restrict process visibility
+
+The host's `/proc` mount controls process visibility.
+A `hidepid=2` mount can hide other users' process directories.
+
+Example fstab entry:
+
+```text
 proc /proc proc nosuid,nodev,noexec,hidepid=2,gid=proc-readers 0 0
 ```
 
-Members of `proc-readers` can see every process; everyone else sees
-only their own. The operator goes in `proc-readers`; tenants do not.
+Configure the `proc-readers` group for the host before using this entry.
+Do not add tenant accounts to a group that bypasses the visibility restriction.
 
-After applying:
+Verify the mount and test access from each account.
+Use a known process owned by another account.
+Access should fail under the intended configuration.
+The error text depends on the host and mount settings.
 
-- `ps -e` as `tenant-foo` shows only `tenant-foo`'s processes.
-- `cat /proc/<tenant-bar-pid>/maps` fails with `ENOENT`.
-- pid-table enumeration via `/proc/*/` reveals only own pids.
+This does not isolate agents that share one user ID.
 
-This closes the cross-uid `/proc` leak channels.
+## Configure cgroup limits
 
-## cgroup delegation
+The current supervisor uses `/sys/fs/cgroup/agents/<name>`.
+It does not automatically select a systemd user-slice subtree.
 
-For agentctl's `cgroup=on` profiles to work without root, the operator
-delegates a cgroup subtree to each tenant's user slice:
+Delegating a user slice alone does not make that path usable.
+Do not grant several untrusted accounts write access to the same cgroup parent.
+Provide a compatible private hierarchy before relying on per-agent limits.
+
+The delegated hierarchy needs the memory, PID and CPU controllers.
+The supervisor must have permission to create its agent cgroups and move its children into them.
+Controller delegation also requires the correct permissions on the common ancestor.
+
+A host-level slice limit can bound processes that remain in that slice.
+For example:
 
 ```sh
-systemctl set-property user-$(id -u tenant-foo).slice \
-    Delegate=memory+pids+cpu
+systemctl set-property user-$(id -u tenant-foo).slice MemoryMax=4G
 ```
 
-Per-tenant resource cap at the slice level (kernel-enforced, even if
-the tenant misconfigures their own profiles):
+Verify process membership.
+Do not assume the supervisor's hardcoded agent path composes with this slice limit.
+
+With cgroup enforcement enabled, configured limits must be written successfully before startup.
+Invalid CPU quotas and failed controller writes return an error.
+Without configured limits, unavailable cgroups retain the process-group fallback.
+
+Cgroup attachment still occurs after `fork`, without a startup barrier.
+This race remains a limit on resource containment.
+
+## Configure network access
+
+agentctl does not create network namespaces.
+The minimal seccomp filter permits socket calls.
+There is no configurable network-syscall denylist in that filter.
+
+A host administrator can place the daemon in a network namespace.
+The namespace also needs its own routing, interface and firewall setup.
+
+Starting `systemctl` inside a namespace does not place a service there.
+The service manager controls where the service runs.
+Configure the service or start the daemon directly in the intended namespace.
+
+Verify the daemon's network namespace and test permitted and denied connections.
+Do not infer network isolation from separate UNIX user IDs.
+
+## Verify the deployment
+
+### State root
+
+Test access to another user's root:
 
 ```sh
-systemctl set-property user-$(id -u tenant-foo).slice \
-    MemoryMax=4G
+sudo -u tenant-foo \
+    env AGENTCTL_ROOT=/run/user/$(id -u tenant-bar)/agentctl \
+    agentctl list
 ```
 
-Per-agent cgroup limits from profiles compose under the slice cap.
+Expect a nonzero exit.
+The error should indicate failed access, ownership or permission checks.
 
-## Network isolation hints
+### Daemon lock
 
-agentctl does not create network namespaces. Two choices for
-tenant network isolation:
+With the service already running, start another daemon under the same root:
 
-- **Hard isolation: per-tenant network namespace.** Run agentd inside
-  the namespace:
+```sh
+sudo -u tenant-foo XDG_RUNTIME_DIR=/run/user/$(id -u tenant-foo) agentd
+```
 
-  ```sh
-  ip netns add tenant-foo
-  ip netns exec tenant-foo \
-      sudo -u tenant-foo systemctl --user start agentd
-  ```
+Expect a nonzero exit and an `another instance` message.
+Confirm that both commands resolve to the same state root.
 
-  Each tenant gets its own loopback. Cross-tenant traffic over
-  loopback is impossible.
+### Process visibility and limits
 
-- **Soft isolation: seccomp-deny network syscalls in tenant agent
-  profiles.** Add `socket(AF_INET, ...)` and `socket(AF_INET6, ...)`
-  to the seccomp denylist for tenant profiles. Tenant agents cannot
-  open inet sockets. Loopback is not blocked.
+Test another user's known PID through `/proc`.
+Check that access fails as required.
 
-Pick based on threat: hard isolation needs `CAP_NET_ADMIN` to set up
-once; soft isolation costs nothing but doesn't stop loopback.
+Inspect cgroup membership and the actual limit files:
 
-## What this setup gives you
+```sh
+systemd-cgls /user.slice/user-$(id -u tenant-foo).slice
+cat /sys/fs/cgroup/user.slice/user-$(id -u tenant-foo).slice/memory.max
+```
 
-- **Filesystem isolation.** Each tenant's data root is 0700 owned by
-  their uid. agentctl ownership-validates the root on every
-  invocation and refuses to operate on a foreign-owned root.
-- **Single-daemon-per-tenant.** agentd holds an exclusive `flock` on
-  `<root>/agentd.lock` for its lifetime. Two daemons cannot run
-  under the same root. The kernel releases the lock on any exit
-  including SIGKILL.
-- **Same-uid control acceptance.** agentd's control socket validates
-  the peer's uid against its own via `SO_PEERCRED` at accept time.
-  Cross-uid control connections are kernel-rejected.
-- **No `/proc` leakage** between tenants (with `hidepid=2`).
-- **Per-tenant cgroup quotas** (with cgroup delegation).
-- **Per-tenant network isolation** (with netns, optional).
+A configured value alone does not prove enforcement.
+Run bounded workloads and check kernel counters.
+Use a disposable VM for resource exhaustion and subtree termination tests.
 
-## What this setup does NOT give you
+### Test suite
 
-- **Intra-tenant adversarial isolation.** Two agents under the same
-  tenant uid can `ptrace` each other, signal each other, and read
-  each other's `/proc` entries. The broker is a logical gate inside
-  one uid, not a kernel boundary. If you need adversarial isolation
-  inside a tenant, use Firecracker, gVisor, or a real container
-  runtime. This is the locked anti-goal in
-  `docs/design-invariants.md`.
-- **Side-channel resistance.** Cache attacks, timing, Spectre — use
-  VMs.
-- **Kernel-exploit resistance.** seccomp narrows but does not
-  eliminate the kernel attack surface.
-- **Cross-tenant audit aggregation.** Each tenant's
-  `<root>/agentd.log` is per-uid. Centralize via journald or your
-  log aggregator if needed.
-- **Tooling for migrating an agent's data between tenants.** Out of
-  scope.
+Build the programs and start the test daemon first.
+Use the tenant's runtime directory:
 
-## Verification checklist
+```sh
+sudo -u tenant-foo XDG_RUNTIME_DIR=/run/user/$(id -u tenant-foo) \
+    sh /path/to/agentctl/tests/run-all.sh
+```
 
-After deploying, the operator should confirm each of these. They are
-phrased as commands an operator can run.
+Inspect failures and skipped checks.
+Some checks need privileges unavailable to a tenant account.
+See [test instructions](../tests/README.md).
 
-1. **Foreign-root refusal:**
-   ```sh
-   sudo -u tenant-foo \
-       env AGENTCTL_ROOT=/run/user/$(id -u tenant-bar)/agentctl \
-       agentctl list
-   ```
-   Expect: non-zero exit and `"owned by uid"` on stderr.
+## Operation
 
-2. **Single agentd per tenant:**
-   ```sh
-   sudo -u tenant-foo systemctl --user start agentd
-   sudo -u tenant-foo agentd   # second invocation
-   ```
-   Expect: second invocation exits non-zero with `"another instance"`.
+Keep shared profiles in an operator-owned directory, such as `/etc/agentctl/profiles`.
+Set `AGENT_PROFILES_DIR` explicitly.
+Do not let tenants change profiles if the host depends on those restrictions.
 
-3. **`/proc` hiding:**
-   ```sh
-   sudo -u tenant-foo cat /proc/$(pidof -s systemd)/maps
-   ```
-   Expect: `ENOENT` under `hidepid=2`.
+The daemon lock is `<root>/agentd.lock`.
+Use `lsof <root>/agentd.lock` to inspect its holder.
 
-4. **cgroup quota:**
-   ```sh
-   systemd-cgls /user.slice/user-$(id -u tenant-foo).slice
-   cat /sys/fs/cgroup/user.slice/user-$(id -u tenant-foo).slice/memory.max
-   ```
-   Expect: `MemoryMax` value visible and enforced.
+`/run/user/<uid>` is temporary state.
+Do not rely on it surviving a reboot.
+The retention policy for `/tmp` depends on the host.
+Use an explicit persistent `AGENTCTL_ROOT` if persistence is required.
 
-5. **agentctl tests under this layout:**
-   ```sh
-   sudo -u tenant-foo XDG_RUNTIME_DIR=/run/user/$(id -u tenant-foo) \
-       sh /path/to/agentctl/tests/run-all.sh
-   ```
-   Expect: `pass=12 fail=0`.
+Collect logs separately if records must cover several accounts.
+agentctl does not provide cross-user log collection or data migration tools.
 
-## Operational notes
+Before moving state to another account, stop the daemon and all related processes.
+Review directory ownership, file permissions, profiles, cgroup placement and retained descriptors before restarting.
 
-- **Profiles dir.** `AGENT_PROFILES_DIR` should point at a
-  read-only-to-the-tenant location (e.g., `/etc/agentctl/profiles/`,
-  owned by the operator, mode `0755`). Tenants cannot edit profiles
-  to widen their own enforcement.
-- **Lockfile location.** Always at `<root>/agentd.lock`. `lsof
-  <root>/agentd.lock` answers "which process holds this?" The
-  lockfile is automatically removed when the data root is wiped
-  (`/run/user/<uid>` on session teardown).
-- **Stale state on host crash.** The data root persists across crashes
-  only if the operator uses `/tmp/agentctl-<uid>` (not wiped) or a
-  similar persistent path. `/run/user/<uid>` is `tmpfs` and is wiped
-  on boot, which is usually what you want — every tenant starts
-  clean.
-- **Migrating a tenant.** Stop the daemon, `chown -R newuid:newuid
-  <root>`, restart as the new uid. agentctl's ownership check will
-  validate the result on first invocation under the new uid.
+Separate accounts do not prevent kernel exploits or side channels.
+They also do not isolate hostile agents within one account.

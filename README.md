@@ -1,27 +1,28 @@
 # agentctl
 
-`agentctl` runs named processes on a Linux host and lets them pass file
-descriptors to one another through a small capability broker.
+`agentctl` runs named processes on Linux. It starts, monitors and stops them.
+A managed process is called an agent.
 
-Because sometimes the answer really is another file descriptor.
+Agents request communication channels from `agentd`, the supervisor.
+The broker checks each request against the agent's policy.
+It transfers approved channels as open file descriptors.
 
-It uses the usual UNIX parts: `AF_UNIX`, `SOCK_SEQPACKET`, `SCM_RIGHTS`,
-`pidfd`, seccomp, Landlock, and cgroup v2. State is kept in ordinary files.
-If something looks wrong, try `ls`, `cat`, `lsof`, or `strace`. The database
-administrator has the day off.
-
-This is a process supervisor, not a container runtime. Programs belonging to
-the same user are not isolated from each other.
+Agents under the same UNIX user ID are not isolated from each other.
+Read [SECURITY.md](SECURITY.md) before deployment.
 
 ## Requirements
 
-- Linux 5.14 or newer for production semantics
-- a C99 compiler and `make`
-- cgroup v2 delegation if cgroup limits are enabled
+- Linux 5.14 or later.
+- Landlock ABI 3 or later for filesystem restrictions. This usually requires Linux 6.2 or later.
+- A C99 compiler, `make` and libc.
+- A delegated cgroup v2 hierarchy for configured resource limits.
 
-macOS builds are useful for development, but its STREAM transport and missing
-Linux enforcement primitives are not equivalent to the Linux runtime. It is
-portable in the traditional UNIX sense: most of it compiles.
+A Linux start fails if requested Landlock or seccomp restrictions cannot be installed.
+Configured cgroup limits also require successful controller writes.
+
+macOS is supported for development builds.
+Its transport and security functions differ from Linux.
+Do not use macOS test results to establish Linux security guarantees.
 
 ## Build
 
@@ -29,10 +30,7 @@ portable in the traditional UNIX sense: most of it compiles.
 make
 ```
 
-There are no library dependencies beyond libc. This may upset the package
-manager, which otherwise had plans for your afternoon.
-
-## First run
+## Run an agent
 
 ```sh
 export AGENT_PROFILES_DIR="$PWD/profiles"
@@ -48,29 +46,28 @@ printf '+TODO\n+strcpy(a,b);\n' | ./agentctl send rb review
 ./agentctl stop rb
 ```
 
-Run `agentctl` without arguments for the command list.
+Run `agentctl` without arguments to see the command list.
 
-`rb` is just an agent name. Naming things remains outside the scope of this
-project, along with the other impossible problem.
+State is stored in `$XDG_RUNTIME_DIR/agentctl`.
+If `XDG_RUNTIME_DIR` is not set, the default is `/tmp/agentctl-<uid>`.
+Set `AGENTCTL_ROOT` to use another directory.
+The directory must belong to the current user and have no group or other permissions.
 
-By default, state is stored in `$XDG_RUNTIME_DIR/agentctl`. If that variable is
-unset, `/tmp/agentctl-<uid>` is used. `AGENTCTL_ROOT` overrides both, mostly for
-tests and unusual installations.
+## Communication
 
-## How it works
+Each supervised agent receives a private broker channel on file descriptor 3.
+It receives incoming channels through file descriptor 4.
+File descriptor 5 serializes broker requests from threads and child processes.
 
-`agentd` owns process lifecycle and the capability broker. Each supervised
-process inherits a private broker socket on fd 3. An agent can request a
-capability named in its policy file; the current implementation supports
-`mailbox.send:<agent>`. Fds 0, 1, and 2 were already taken by historical
-mistakes we have learned to live with.
+The implemented capability is `mailbox.send:<agent>`.
+A capability is permission to use an open file descriptor.
 
-A successful request creates a fresh socketpair. One end goes to the requester
-and the other to the target's private inbox. `agentd` keeps neither end. The
-kernel transfers the descriptors with `SCM_RIGHTS`, so possession of the fd is
-the authority. There is no bearer token pretending to be a file descriptor.
+For each approved request, `agentd` creates a socket pair.
+It sends one end to the requester and the other end to the target.
+It uses `SCM_RIGHTS` to transfer the descriptors.
+It then closes its copies.
 
-Application messages use a short ASCII header followed by opaque bytes:
+Application messages have an ASCII header and a byte payload:
 
 ```text
 VERB review
@@ -81,65 +78,72 @@ LEN 7
 payload
 ```
 
-Linux uses `SOCK_SEQPACKET`: one send is one message. Truncated frames,
-truncated ancillary data, duplicate headers, invalid lengths, and oversized
-fields are rejected. Two `LEN` headers are treated as a protocol violation,
-not an invitation to form a standards committee. Received descriptors are
-marked close-on-exec.
+Linux uses `AF_UNIX` with `SOCK_SEQPACKET`.
+Each send operation produces one message.
+The transport rejects truncated messages, truncated descriptor data, duplicate known headers and invalid length fields.
+It marks received descriptors close-on-exec.
 
-## Supervision
+The application must validate payload contents.
+`REPLY-TO` is a routing field, not proof of sender identity.
+See [sender identity](SECURITY.md#sender-identity) for the broker metadata and its limits.
 
-On Linux, `pidfd` is used for liveness and signalling. `cgroup.kill` terminates
-an owned process subtree when cgroup support is active. Short-lived crashes get
-exponential restart backoff; the fifth consecutive short run is marked as a
-crash loop. This is preferable to turning a typo into a heating appliance.
+## Process control
 
-Profiles can apply:
+On Linux, `agentd` uses pidfds to monitor processes and send signals.
+It uses an owned `cgroup.kill` descriptor to terminate a process subtree when available.
+Otherwise, it uses the process group.
+Children that create another session can survive the process-group fallback.
 
-- Landlock filesystem rules
-- a minimal seccomp filter
-- cgroup memory, process, and CPU limits
-- restart and artifact policies
+Restart delays increase after short runs.
+The fifth consecutive run shorter than 30 seconds stops automatic restarts.
+An explicit start clears this state.
 
-Profiles are read when a process starts. They are not hot-reloaded. Change the
-file and restart the process, as Thompson and Ritchie intended.
+Profiles set filesystem restrictions, seccomp filters and cgroup limits.
+They also set dispatch and artifact policies.
+The supervisor reads profiles at process start.
+Restart the process after a profile change.
 
-## Security model
+CPU quotas use `quota/period`, in microseconds.
+Use `max/period` for an explicit unlimited quota.
+Invalid values or failed limit writes prevent startup when cgroup limits are configured.
 
-The intended boundary is between different UNIX users on one host. Each user
-gets a private `0700` state root, and `agentd` checks its ownership before doing
-anything. A lock file permits one daemon per root. The control socket also
-checks peer credentials and requires a random per-root authentication token.
+Cgroup attachment and supervisor recovery have known limits.
+See [process control limits](SECURITY.md#process-control-limits).
 
-Agents running as the same uid can still use `ptrace`, signals, `/proc`, and
-descriptor forwarding against each other. If they do not trust one another,
-give them separate users, namespaces, or virtual machines. No amount of
-adjectives in this README changes what the kernel permits. UNIX assumes a uid
-is a family, and families know where the bodies are buried.
+## Security limits
 
-Other limits worth knowing:
+Each UNIX user has a separate state directory.
+The directory is created with mode `0700`.
+The programs check its owner and permissions before use.
+An exclusive lock permits one daemon per state directory.
 
-- a delivered fd cannot be revoked from another process; UNIX has no
-  take-backsies, so restart the holder
-- network egress is not blocked by default
-- audit logs are useful, not cryptographically tamper-evident
-- direct mode retains cooperative pathname mailboxes
-- untrusted executable code needs a real sandbox
+The control socket checks peer credentials and requires an authentication token.
+These checks do not isolate agents that share a UNIX user ID.
 
-Read [SECURITY.md](SECURITY.md) before using this around anything valuable.
+Other limits apply:
+
+- An agent can retain or copy a delivered descriptor. The broker cannot revoke it.
+- Network connections are not blocked by default.
+- Audit files do not have cryptographic integrity protection.
+- Direct mode uses pathname mailboxes and requires cooperating processes.
+- Do not run code that you do not trust without a separate sandbox.
+
+The host administrator must configure user accounts, cgroup delegation and any required network or process visibility restrictions.
 
 ## Tests
 
+Build the programs and start `agentd` before running the suite:
+
 ```sh
 make
-sh tests/run-all.sh       # expects agentd to be running
+export PATH="$PWD:$PATH"
+sh tests/run-all.sh
 ```
 
-The full Linux suite is also run in CI. It covers protocol truncation, fd
-flags, broker denial and issuance, concurrent requests, authority boundaries,
-daemon locking, and restart suppression.
+The Linux suite runs in CI.
+It tests message parsing, descriptor handling, broker policy, process control, daemon locks and the Python SDK.
 
-The protocol parsers have libFuzzer harnesses:
+Parser fuzz tests require Clang with libFuzzer:
 
 ```sh
 make fuzz
@@ -147,26 +151,25 @@ tests/fuzz/fuzz-broker tests/fuzz/corpus/broker -max_total_time=60
 tests/fuzz/fuzz-ipc tests/fuzz/corpus/ipc -max_total_time=60
 ```
 
-`tests/README.md` has the test matrix. QEMU integration support lives under
-`kernel/dev` for tests that need real Linux kernel facilities. A passing test
-suite means the remaining bugs have become more interesting.
+See [tests/README.md](tests/README.md) for test setup and coverage.
+Some checks require privileges or kernel functions that are unavailable in a normal Docker container.
+The `kernel/dev` directory contains QEMU test tools.
 
-## Status
+## Project status
 
-This is a working prototype. It builds on Linux and macOS, passes the Linux
-regression suite, and has sanitizer-backed parser fuzzing. It has not had the
-independent review, soak testing, packaging, or operational abuse required for
-a production release. Please do not infer an SLA from the presence of a
-Makefile.
+This is a prototype.
+Do not use it for security-sensitive workloads without a separate review of your deployment.
+A successful build or test run is not proof of production readiness.
 
-Delegation, leases, and filesystem capability issuance are not implemented.
-The `agentfs` kernel module is a research artifact, not a second production
-path. One production path is already plenty.
+Capability delegation, leases and filesystem capability issuance are not implemented.
+The `agentfs` kernel module is research code.
+It is not a supported production transport.
 
-Useful reading:
+## Reference documents
 
-- [design invariants](docs/design-invariants.md)
-- [capability broker notes](docs/capabilities.md)
-- [multi-user deployment](docs/multi-tenant.md)
-- [macOS development notes](docs/macos.md)
-- [benchmarks](BENCHMARKS.md)
+- [Proposed single-host scheduler](docs/scheduler-spec.md)
+- [Design invariants](docs/design-invariants.md)
+- [Capability broker](docs/capabilities.md)
+- [Multiple-user deployment](docs/multi-tenant.md)
+- [macOS development](docs/macos.md)
+- [Benchmarks](BENCHMARKS.md)

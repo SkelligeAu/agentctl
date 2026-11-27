@@ -35,10 +35,15 @@ const char *enforce_fs_name(enforce_fs_mode_t m);
 const char *seccomp_mode_name(seccomp_mode_t m);
 const char *enforce_status_word(int status);  /* "active" "inactive" "unavailable" */
 
+/* Validate quota/period and produce the kernel's "quota period" form.
+ * Quota is "max" or a positive decimal value. Units are microseconds. */
+int enforcement_cpu_max_format(const char *value, char *out, size_t size);
+
 /* Parent: write enforcement.req describing what is being attempted. */
 int enforcement_write_req(const char *agent_name, const enforcement_spec_t *spec);
 
-/* Parent: set up cgroup if requested. Records result into `state`. Linux-only;
+/* Parent: set up cgroup if requested. Returns -1 on a Linux setup/limit-write
+ * failure and persists UNAVAILABLE plus its reason in `state`. Linux-only;
  * on other platforms returns 0 with state->cgroup_status = UNAVAILABLE. */
 int enforcement_parent_setup(const char *agent_name,
                               const enforcement_spec_t *spec,

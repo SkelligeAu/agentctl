@@ -13,22 +13,25 @@ written in Python instead of C — the architectural boundary
 (identity / mailbox / lifecycle in the kernel; everything else in
 userspace) is preserved.
 
-Transports:
-  - UDS    /tmp/agents/<name>/agent.sock
-  - agentfs <mount>/agents/<name>/inbox  (linux-only, kernel module)
-Selected per-agent via /tmp/agents/<name>/transport. The same SDK
-handles both: only the listener setup branches.
+Supervised agents receive private channels through fd 4 and obtain outbound
+channels through the broker on fd 3. Direct mode retains pathname sockets.
+Linux uses SOCK_SEQPACKET; macOS uses SOCK_STREAM with a LEN header.
+Application files are under data/, settings under config/, and status under
+runtime/. The legacy agentfs transport remains available for research.
 """
 
 from __future__ import annotations
 
 import errno
+import array
+import fcntl
 import os
 import re
 import selectors
 import signal
 import socket
 import sys
+import threading
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Callable, Optional, Tuple
@@ -53,6 +56,53 @@ def _resolve_agentctl_root() -> str:
 AGENTCTL_ROOT = _resolve_agentctl_root()
 AGENT_ROOT = os.path.join(AGENTCTL_ROOT, "agents")
 MAX_PAYLOAD = 1 << 20  # 1 MiB — matches MAX_PAYLOAD in common.h
+_SOCKET_TYPE = socket.SOCK_SEQPACKET if sys.platform == "linux" else socket.SOCK_STREAM
+_BROKER_LOCK = threading.Lock()
+
+
+def _component(value: str, limit: int = 64) -> bool:
+    return (0 < len(value) < limit and not value.startswith(".")
+            and re.fullmatch(r"[A-Za-z0-9_.-]+", value) is not None)
+
+
+def _recv_fds(conn: socket.socket, size: int, max_fds: int = 8):
+    data, ancillary, flags, _ = conn.recvmsg(
+        size, socket.CMSG_SPACE(max_fds * array.array("i").itemsize),
+        getattr(socket, "MSG_CMSG_CLOEXEC", 0))
+    fds = []
+    for level, kind, raw in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            values = array.array("i")
+            values.frombytes(raw[:len(raw) - len(raw) % values.itemsize])
+            fds.extend(values)
+    try:
+        for fd in fds:
+            os.set_inheritable(fd, False)
+        if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+            raise OSError(errno.EPROTO, "truncated descriptor delivery")
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
+    return data, fds
+
+
+def _broker_connect(target: str) -> socket.socket:
+    if not _component(target):
+        raise ValueError("invalid agent name")
+    with _BROKER_LOCK:
+        fcntl.lockf(5, fcntl.LOCK_EX)
+        try:
+            with socket.socket(fileno=os.dup(3)) as broker:
+                broker.sendall(f"VERB request\nCAP mailbox.send:{target}\nREASON python-sdk\n\n".encode())
+                response, fds = _recv_fds(broker, 512)
+            if len(fds) != 1 or not response.startswith(b"VERB issued\n"):
+                for fd in fds:
+                    os.close(fd)
+                raise OSError(errno.EACCES, response.decode(errors="replace"))
+            return socket.socket(fileno=fds[0])
+        finally:
+            fcntl.lockf(5, fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +161,15 @@ def _resolve_transport(agent_dir: str) -> Tuple[str, Optional[str]]:
 
 def _build_frame(verb: str, payload: bytes,
                  reply_to: str = "", task_id: str = "") -> bytes:
-    lines = [f"VERB {verb}", f"LEN {len(payload)}"]
+    if not _component(verb) or len(payload) > MAX_PAYLOAD:
+        raise ValueError("invalid verb or oversized payload")
+    if reply_to and not _component(reply_to):
+        raise ValueError("invalid reply target")
+    if task_id and not _component(task_id, 32):
+        raise ValueError("invalid task id")
+    lines = [f"VERB {verb}"]
+    if sys.platform != "linux":
+        lines.append(f"LEN {len(payload)}")
     if reply_to:
         lines.append(f"REPLY-TO {reply_to}")
     if task_id:
@@ -119,17 +177,25 @@ def _build_frame(verb: str, payload: bytes,
     return ("\n".join(lines) + "\n\n").encode() + payload
 
 
-def _parse_frame(buf: bytes) -> Tuple[Optional[dict], int]:
+def _parse_frame(buf: bytes, packet: Optional[bool] = None) -> Tuple[Optional[dict], int]:
     """Parse one full frame from `buf`. Returns (msg, consumed) or (None, 0)."""
+    if packet is None:
+        packet = sys.platform == "linux"
     sep = buf.find(b"\n\n")
     if sep < 0:
         return (None, 0)
     header = buf[:sep].decode("utf-8", errors="replace")
     msg = {"verb": None, "payload": b"", "reply_to": "", "task_id": ""}
     plen = -1
+    seen = set()
     for line in header.split("\n"):
         if not line:
             continue
+        field = line.split(" ", 1)[0]
+        if field in ("VERB", "LEN", "REPLY-TO", "TASK-ID"):
+            if field in seen:
+                return (None, 0)
+            seen.add(field)
         if line.startswith("VERB "):
             msg["verb"] = line[5:].lstrip()
         elif line.startswith("LEN "):
@@ -142,10 +208,17 @@ def _parse_frame(buf: bytes) -> Tuple[Optional[dict], int]:
         elif line.startswith("TASK-ID "):
             msg["task_id"] = line[8:].lstrip()
         # unknown headers ignored (forward-compat, same as the C runtime)
-    if plen < 0 or not msg["verb"]:
+    if packet and plen < 0:
+        plen = len(buf) - sep - 2
+    if (plen < 0 or plen > MAX_PAYLOAD
+            or not _component(msg["verb"] or "")
+            or (msg["reply_to"] and not _component(msg["reply_to"]))
+            or (msg["task_id"] and not _component(msg["task_id"], 32))):
         return (None, 0)
     start = sep + 2
     if len(buf) - start < plen:
+        return (None, 0)
+    if packet and len(buf) - start != plen:
         return (None, 0)
     msg["payload"] = bytes(buf[start:start + plen])
     return (msg, start + plen)
@@ -153,9 +226,14 @@ def _parse_frame(buf: bytes) -> Tuple[Optional[dict], int]:
 
 def _recv_one_frame(conn: socket.socket) -> Optional[dict]:
     """Blocking read of one full frame from a connected UDS client."""
+    if conn.type == socket.SOCK_SEQPACKET:
+        data, fds = _recv_fds(conn, MAX_PAYLOAD + 4096)
+        for fd in fds:
+            os.close(fd)
+        return _parse_frame(data, packet=True)[0] if data else None
     buf = bytearray()
     while True:
-        msg, _used = _parse_frame(bytes(buf))
+        msg, _used = _parse_frame(bytes(buf), packet=False)
         if msg is not None:
             return msg
         try:
@@ -165,6 +243,8 @@ def _recv_one_frame(conn: socket.socket) -> Optional[dict]:
         if not chunk:
             return None
         buf.extend(chunk)
+        if len(buf) > MAX_PAYLOAD + 4096:
+            raise OSError(errno.EMSGSIZE, "oversized frame")
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +262,7 @@ def _recv_one_frame(conn: socket.socket) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _caps_text(agent_dir: str) -> str:
-    return _read_text(os.path.join(agent_dir, "policy")) or ""
+    return _read_text(os.path.join(os.path.dirname(agent_dir), "config", "policy")) or ""
 
 
 def _cap_allows(caps_text: str, cap: str) -> bool:
@@ -230,9 +310,12 @@ class Task:
         self._agent = agent
         self.verb: str = msg["verb"]
         self.payload: bytes = msg["payload"]
-        self.sender: str = msg.get("reply_to") or "?"
+        self.sender: str = msg.get("authenticated_name") or msg.get("reply_to") or "?"
+        self.reply_to: str = msg.get("reply_to") or ""
         self.incoming_task_id: str = msg.get("task_id") or ""
         self.task_id: str = self.incoming_task_id or agent._alloc_task_id()
+        if not _component(self.task_id, 32):
+            raise ValueError("invalid task id")
         self._dir = os.path.join(agent._agent_dir, "tasks", self.task_id)
         self._completed = False
         os.makedirs(os.path.join(self._dir, "artifacts"), exist_ok=True)
@@ -242,10 +325,10 @@ class Task:
         _atomic_write(os.path.join(self._dir, "updated_at"), now)
         _atomic_write(os.path.join(self._dir, "verb"), self.verb + "\n")
         _atomic_write(os.path.join(self._dir, "sender"), self.sender + "\n")
-        _atomic_write(os.path.join(self._dir, "sender_pid"), "0\n")
-        _atomic_write(os.path.join(self._dir, "sender_uid"), "0\n")
-        if self.sender != "?":
-            _atomic_write(os.path.join(self._dir, "reply_to"), self.sender + "\n")
+        _atomic_write(os.path.join(self._dir, "sender_pid"), f"{msg.get('sender_pid', 0)}\n")
+        _atomic_write(os.path.join(self._dir, "sender_uid"), f"{msg.get('sender_uid', 0)}\n")
+        if self.reply_to:
+            _atomic_write(os.path.join(self._dir, "reply_to"), self.reply_to + "\n")
         if self.incoming_task_id:
             _atomic_write(os.path.join(self._dir, "incoming_task_id"),
                           self.incoming_task_id + "\n")
@@ -265,8 +348,27 @@ class Task:
 
     def write_artifact(self, name: str, content) -> None:
         """Atomic overwrite — matches the worker profile's default policy."""
-        path = os.path.join(self._dir, "artifacts", name)
-        _atomic_write(path, content)
+        if not isinstance(name, str) or not _component(name, 128):
+            raise ValueError("invalid artifact name")
+        data = content.encode() if isinstance(content, str) else content
+        directory = os.open(os.path.join(self._dir, "artifacts"),
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        temporary = ".artifact-" + os.urandom(12).hex()
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    output.write(data)
+                os.replace(temporary, name, src_dir_fd=directory,
+                           dst_dir_fd=directory)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(directory)
         n = len(content) if isinstance(content, (bytes, bytearray)) \
             else len(content.encode())
         self._agent.log(f"task={self.task_id} artifact={name} bytes={n}")
@@ -285,12 +387,12 @@ class Task:
         self._completed = True
 
     def reply(self, payload=b"", verb: str = "result") -> None:
-        if self.sender == "?":
+        if not self.reply_to:
             return
         if isinstance(payload, str):
             payload = payload.encode()
         corr = self.incoming_task_id or self.task_id
-        self._agent._send(self.sender, verb,
+        self._agent._send(self.reply_to, verb,
                           reply_to=self._agent.name,
                           task_id=corr, payload=payload)
 
@@ -317,7 +419,12 @@ class Agent:
                 raise SystemExit("python-agent: missing <name> argv")
             name = sys.argv[1]
         self.name = name
-        self._agent_dir = os.path.join(AGENT_ROOT, name)
+        if not _component(name):
+            raise ValueError("invalid agent name")
+        self._base_dir = os.path.join(AGENT_ROOT, name)
+        self._config_dir = os.path.join(self._base_dir, "config")
+        self._runtime_dir = os.path.join(self._base_dir, "runtime")
+        self._agent_dir = os.path.join(self._base_dir, "data")
         if not os.path.isdir(self._agent_dir):
             raise SystemExit(
                 f"python-agent: {self._agent_dir} missing — "
@@ -325,8 +432,9 @@ class Agent:
         os.chdir(self._agent_dir)
         self.handlers: dict[str, Callable] = {}
         self._task_seq = self._load_max_task_seq() + 1
-        self._kind, self._mount = _resolve_transport(self._agent_dir)
+        self._kind, self._mount = _resolve_transport(self._config_dir)
         self._listener: Optional[socket.socket] = None
+        self._delivery: Optional[socket.socket] = None
         self._inbox_fd: int = -1
         self._shutdown = False
         self._setup_listener()
@@ -341,11 +449,11 @@ class Agent:
     # ---- on-disk helpers --------------------------------------------------
 
     def _read_profile(self) -> str:
-        v = _read_text(os.path.join(self._agent_dir, "profile"))
+        v = _read_text(os.path.join(self._config_dir, "profile"))
         return (v.strip() if v else "worker") or "worker"
 
     def _set_status(self, s: str) -> None:
-        _atomic_write(os.path.join(self._agent_dir, "status"), s + "\n")
+        _atomic_write(os.path.join(self._runtime_dir, "status"), s + "\n")
 
     def log(self, line: str) -> None:
         _append_file(os.path.join(self._agent_dir, "audit.log"),
@@ -374,13 +482,16 @@ class Agent:
     # ---- transport listener ----------------------------------------------
 
     def _setup_listener(self) -> None:
+        if os.environ.get("AGENTCTL_INBOX_FD") == "4":
+            self._delivery = socket.socket(fileno=os.dup(4))
+            return
         if self._kind == "uds":
             sock_path = os.path.join(self._agent_dir, "agent.sock")
             try:
                 os.unlink(sock_path)
             except FileNotFoundError:
                 pass
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s = socket.socket(socket.AF_UNIX, _SOCKET_TYPE)
             s.bind(sock_path)
             os.chmod(sock_path, 0o600)
             s.listen(8)
@@ -400,13 +511,19 @@ class Agent:
     def _send(self, target: str, verb: str,
               reply_to: str = "", task_id: str = "",
               payload: bytes = b"") -> None:
-        target_dir = os.path.join(AGENT_ROOT, target)
-        kind, mount = _resolve_transport(target_dir)
+        if not _component(target):
+            raise ValueError("invalid agent name")
         frame = _build_frame(verb, payload, reply_to, task_id)
+        if self._delivery is not None:
+            with _broker_connect(target) as conn:
+                conn.sendall(frame)
+            return
+        target_dir = os.path.join(AGENT_ROOT, target)
+        kind, mount = _resolve_transport(os.path.join(target_dir, "config"))
         if kind == "uds":
-            sock_path = os.path.join(target_dir, "agent.sock")
+            sock_path = os.path.join(target_dir, "data", "agent.sock")
             try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s = socket.socket(socket.AF_UNIX, _SOCKET_TYPE)
                 s.connect(sock_path)
                 s.sendall(frame)
                 s.close()
@@ -451,9 +568,10 @@ class Agent:
 
     def _dispatch(self, msg: dict) -> None:
         verb = msg["verb"]
-        sender = msg.get("reply_to") or "?"
+        sender = msg.get("authenticated_name") or msg.get("reply_to") or "?"
         plen = len(msg["payload"])
-        self.log(f"recv verb={verb} from={sender} pid=0 uid=0 len={plen}")
+        self.log(f"recv verb={verb} from={sender} "
+                 f"pid={msg.get('sender_pid', 0)} uid={msg.get('sender_uid', 0)} len={plen}")
         if verb == "ping":
             return  # parity with the C reviewer: ping never creates a task
         handler = self.handlers.get(verb)
@@ -475,27 +593,35 @@ class Agent:
             task.fail(f"{type(exc).__name__}: {exc}")
         finally:
             self._set_status("idle")
-        if sender != "?":
+        reply_to = msg.get("reply_to") or ""
+        if reply_to:
             corr = task.incoming_task_id or task.task_id
             try:
                 with open(os.path.join(task._dir, "result"), "rb") as f:
                     body = f.read()
             except FileNotFoundError:
                 body = b""
-            self._send(sender, "result", reply_to=self.name,
-                       task_id=corr, payload=body)
-            self.log(f"reply -> {sender} ok (task={corr})")
+            try:
+                self._send(reply_to, "result", reply_to=self.name,
+                           task_id=corr, payload=body)
+                self.log(f"reply -> {reply_to} ok (task={corr})")
+            except OSError as exc:
+                self.log(f"reply -> {reply_to} failed: {exc}")
 
     def run(self) -> None:
         self._install_signals()
         try:
-            if self._kind == "uds":
+            if self._delivery is not None:
+                self._run_delivery()
+            elif self._kind == "uds":
                 self._run_uds()
             else:
                 self._run_agentfs()
         finally:
             self._set_status("stopping")
             self.log("python-agent shutting down")
+            if self._delivery is not None:
+                self._delivery.close()
             if self._kind == "uds" and self._listener:
                 try:
                     self._listener.close()
@@ -518,6 +644,37 @@ class Agent:
                 pass
         except BlockingIOError:
             pass
+
+    def _run_delivery(self) -> None:
+        assert self._delivery is not None
+        with selectors.DefaultSelector() as sel:
+            sel.register(self._delivery, selectors.EVENT_READ, "delivery")
+            sel.register(self._wakeup_r, selectors.EVENT_READ, "wakeup")
+            while not self._shutdown:
+                for key, _mask in sel.select():
+                    if key.data == "wakeup":
+                        self._drain_wakeup()
+                        continue
+                    data, fds = _recv_fds(self._delivery, 256)
+                    if len(fds) != 1:
+                        for fd in fds:
+                            os.close(fd)
+                        self.log("invalid inbox delivery")
+                        continue
+                    with socket.socket(fileno=fds[0]) as conn:
+                        conn.settimeout(30)
+                        try:
+                            msg = _recv_one_frame(conn)
+                        except OSError as exc:
+                            self.log(f"receive failed: {exc}")
+                            continue
+                    if msg is not None:
+                        metadata = dict(line.split(" ", 1) for line in
+                                        data.decode("ascii").splitlines() if " " in line)
+                        msg["authenticated_name"] = metadata.get("SENDER", "")
+                        msg["sender_pid"] = int(metadata.get("PID", "0"))
+                        msg["sender_uid"] = int(metadata.get("UID", "0"))
+                        self._dispatch(msg)
 
     def _run_uds(self) -> None:
         assert self._listener is not None

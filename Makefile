@@ -5,7 +5,7 @@ LDFLAGS ?=
 
 BINS = agentctl agentd reviewer-agent fanout-agent psa broker-test broker-fault broker-concurrency
 TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec \
-	tests/test_input_validation tests/phase1-probe tests/crash-agent
+	tests/test_input_validation tests/test_ipc_fd_cleanup tests/phase1-probe tests/crash-agent tests/runtime-regression
 LIBOBJS = common.o ipc.o broker.o profiles.o tasks.o enforcement.o
 LIB = libagentctl.a
 FUZZ_CC ?= clang
@@ -68,6 +68,9 @@ tests/test_ipc_msg_ctrunc: tests/test_ipc_msg_ctrunc.c $(LIBOBJS)
 tests/test_cloexec: tests/test_cloexec.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_cloexec.c $(LIBOBJS)
 
+tests/test_ipc_fd_cleanup: tests/test_ipc_fd_cleanup.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_ipc_fd_cleanup.c $(LIBOBJS)
+
 tests/test_input_validation: tests/test_input_validation.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_input_validation.c $(LIBOBJS)
 
@@ -76,6 +79,9 @@ tests/phase1-probe: tests/phase1-probe.c
 
 tests/crash-agent: tests/crash-agent.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/crash-agent.c $(LIBOBJS)
+
+tests/runtime-regression: tests/runtime-regression.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/runtime-regression.c $(LIBOBJS)
 
 agentctl.o: agentctl.c common.h profiles.h tasks.h enforcement.h
 	$(CC) $(CFLAGS) -c -o $@ agentctl.c

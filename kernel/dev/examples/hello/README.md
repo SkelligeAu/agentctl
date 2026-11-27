@@ -1,24 +1,34 @@
-# hello — smallest possible out-of-tree module
+# Hello kernel module
 
-If this builds and loads, the whole pipeline (Docker image → kernel tree →
-kbuild → QEMU → insmod) is healthy. Use it as your smoke test before
-debugging anything fancier.
+Use this module to check the kernel build and QEMU loading procedure.
 
-```
-# from kernel/dev/
+Run these commands from `kernel/dev`:
+
+```sh
 make image
-make fetch-kernel       # downloads + extracts linux-<ver>.tar.xz
-make kernel             # configures + builds; ~5–15 min depending on host
-make rootfs             # tiny busybox initramfs
-make hello              # builds hello.ko, copies it into share/
-make qemu               # boots the VM
+make fetch-kernel
+make kernel
+make rootfs
+make hello
+make qemu
+```
 
-# inside the VM (autostarts at /init):
+If an executable integration script is present, the guest runs it and powers off.
+Use `make qemu-shell` when you need an interactive guest shell.
+
+In the guest:
+
+```sh
 insmod /mnt/share/hello.ko
 dmesg | tail -3
-# -> hello: loaded
+# Expected: hello: loaded
+
 rmmod hello
 dmesg | tail -3
-# -> hello: unloaded
-poweroff -f             # or Ctrl-A, x
+# Expected: hello: unloaded
+
+poweroff -f
 ```
+
+You can also exit QEMU with Ctrl-A, then x.
+Load this module only in the test guest, not in the Docker container.

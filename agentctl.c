@@ -387,6 +387,15 @@ static int cmd_start(const char *name, const char *runtime_path,
     /* Canonical state lives on disk. Always write the trigger files; either
      * agentd will pick the change up via inotify, or — if there's no daemon
      * — we play the role of supervisor ourselves for this one shot. */
+    /* Persist all overrides before desired_state can trigger reconciliation.
+     * -1 resets to the selected profile; restarts retain this start's policy. */
+    char overrides[96];
+    snprintf(overrides, sizeof(overrides), "fs=%d seccomp=%d cgroup=%d",
+             fs_override, sc_override, cg_override);
+    if (write_agent_setting(name, "enforcement.overrides", overrides) != 0) {
+        fprintf(stderr, "start: cannot record enforcement overrides: %s\n", strerror(errno));
+        return 1;
+    }
     write_agent_setting(name, "exec", runtime_path);
     write_agent_setting(name, "desired_state", "running");
 
@@ -1073,23 +1082,25 @@ static int cmd_kill(const char *name)
         fprintf(stderr, "kill: no agent at %s\n", dir);
         return 1;
     }
+    if (agentd_is_alive()) {
+        char command[256], response[256] = {0};
+        snprintf(command, sizeof(command), "kill %s", name);
+        if (agentd_request(command, response, sizeof(response)) != 0 ||
+            strncmp(response, "OK ", 3) != 0) {
+            fprintf(stderr, "kill: agentd: %s\n", response[0] ? response : strerror(errno));
+            return 1;
+        }
+        printf("killed %s (via agentd)\n", name);
+        goto cleanup;
+    }
     pid_t pid = -1;
     int have_pid = (read_pid_file(name, &pid) == 0);
     if (have_pid && run_alive(pid)) {
-        /* Prefer cgroup.kill (atomic subtree SIGKILL) when the profile has
-         * cgroup ownership and the cgroup is reachable. Falls back to
-         * pidfd+killpg otherwise. */
-        enforcement_state_t es;
-        int used_cgroup = 0;
-        if (enforcement_read_state(name, &es) == 0 &&
-            es.cgroup_status == ENF_STATUS_ACTIVE && es.cgroup_path[0]) {
-            if (lifecycle_cgroup_kill(es.cgroup_path) == 0) {
-                used_cgroup = 1;
-            }
-        }
+        /* Runtime projections are untrusted. Only agentd holds an owned
+         * cgroup handle; direct mode must use its existing PID fallback. */
         int pidfd = -1;
         int via_pidfd = 0;
-        if (!used_cgroup) {
+        {
             /* Same lazy-pidfd pattern as cmd_stop; see caveat there. */
             pidfd = lifecycle_pidfd_open(pid);
             via_pidfd = (pidfd >= 0);
@@ -1108,11 +1119,11 @@ static int cmd_kill(const char *name)
         wait_pid_gone(pid, pidfd, 500);
         if (pidfd >= 0) close(pidfd);
         printf("killed %s (pid %ld)%s\n", name, (long)pid,
-               used_cgroup ? " (cgroup.kill)" :
                (via_pidfd  ? " (pidfd)"        : ""));
     } else {
         printf("killed %s (no live process)\n", name);
     }
+cleanup:
     if (remove_tree(dir) != 0) {
         fprintf(stderr, "kill: cleanup %s: %s\n", dir, strerror(errno));
         return 1;

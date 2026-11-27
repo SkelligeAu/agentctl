@@ -4,12 +4,40 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+int enforcement_cpu_max_format(const char *value, char *out, size_t size)
+{
+    if (!value || !out || !size) { errno = EINVAL; return -1; }
+    const char *slash = strchr(value, '/');
+    if (!slash || slash == value || !slash[1] || strchr(slash + 1, '/')) goto invalid;
+    int unlimited = slash - value == 3 && !memcmp(value, "max", 3);
+    if (!unlimited)
+        for (const char *p = value; p < slash; p++)
+            if (*p < '0' || *p > '9') goto invalid;
+    for (const char *p = slash + 1; *p; p++)
+        if (*p < '0' || *p > '9') goto invalid;
+    char *end;
+    errno = 0;
+    unsigned long long quota = unlimited ? 0 : strtoull(value, &end, 10);
+    if (!unlimited && (errno || end != slash || quota < 1000 || quota > ULLONG_MAX / 1000)) goto invalid;
+    errno = 0;
+    unsigned long long period = strtoull(slash + 1, &end, 10);
+    if (errno || *end || period < 1000 || period > 1000000) goto invalid;
+    int n = unlimited ? snprintf(out, size, "max %llu", period)
+                      : snprintf(out, size, "%llu %llu", quota, period);
+    if (n < 0 || (size_t)n >= size) { errno = ENOSPC; return -1; }
+    return 0;
+invalid:
+    errno = EINVAL;
+    return -1;
+}
 
 /* ---------- name conversions ---------- */
 
@@ -192,15 +220,29 @@ static int write_str(const char *path, const char *val)
     int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd == -1) return -1;
     size_t l = strlen(val);
-    if (write(fd, val, l) != (ssize_t)l) { int e = errno; close(fd); errno = e; return -1; }
+    ssize_t n = write(fd, val, l);
+    if (n != (ssize_t)l) { int e = n < 0 ? errno : EIO; close(fd); errno = e; return -1; }
     close(fd);
     return 0;
+}
+
+static int cgroup_error(enforcement_state_t *st, const char *operation)
+{
+    int saved = errno;
+    st->cgroup_status = ENF_STATUS_UNAVAILABLE;
+    snprintf(st->reason, sizeof(st->reason), "%s: %s", operation, strerror(saved));
+    errno = saved;
+    return -1;
 }
 
 static int cgroup_setup_linux(const char *agent_name,
                               const enforcement_spec_t *spec,
                               enforcement_state_t *st)
 {
+    st->cgroup_status = ENF_STATUS_UNAVAILABLE;
+    char cpu[64];
+    if (spec->cg_cpu_max[0] && enforcement_cpu_max_format(spec->cg_cpu_max, cpu, sizeof(cpu)) != 0)
+        return cgroup_error(st, "cpu.max invalid quota/period");
     char dir[256];
     int n = snprintf(dir, sizeof(dir), "/sys/fs/cgroup/agents/%s", agent_name);
     if (n < 0 || (size_t)n >= sizeof(dir)) { errno = ENAMETOOLONG; return -1; }
@@ -228,29 +270,19 @@ static int cgroup_setup_linux(const char *agent_name,
         snprintf(path, sizeof(path), "%s/memory.max", dir);
         snprintf(val, sizeof(val), "%ld", spec->cg_memory_max);
         if (write_str(path, val) != 0) {
-            snprintf(st->reason, sizeof(st->reason),
-                     "memory.max: %s", strerror(errno));
+            return cgroup_error(st, "memory.max");
         }
     }
     if (spec->cg_pids_max > 0) {
         snprintf(path, sizeof(path), "%s/pids.max", dir);
         snprintf(val, sizeof(val), "%ld", spec->cg_pids_max);
         if (write_str(path, val) != 0) {
-            snprintf(st->reason, sizeof(st->reason),
-                     "pids.max: %s", strerror(errno));
+            return cgroup_error(st, "pids.max");
         }
     }
     if (spec->cg_cpu_max[0]) {
         snprintf(path, sizeof(path), "%s/cpu.max", dir);
-        /* cpu.max wants "quota period"; users write "quota/period". Convert. */
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%s", spec->cg_cpu_max);
-        char *slash = strchr(buf, '/');
-        if (slash) *slash = ' ';
-        if (write_str(path, buf) != 0) {
-            snprintf(st->reason, sizeof(st->reason),
-                     "cpu.max: %s", strerror(errno));
-        }
+        if (write_str(path, cpu) != 0) return cgroup_error(st, "cpu.max");
     }
     st->cgroup_status = ENF_STATUS_ACTIVE;
     return 0;
@@ -278,6 +310,9 @@ static int cgroup_attach_pid_linux(const enforcement_state_t *st, pid_t pid)
 #ifdef HAVE_LANDLOCK
 #ifndef LANDLOCK_ACCESS_FS_REFER
 #define LANDLOCK_ACCESS_FS_REFER (1ULL << 13)
+#endif
+#ifndef LANDLOCK_ACCESS_FS_TRUNCATE
+#define LANDLOCK_ACCESS_FS_TRUNCATE (1ULL << 14)
 #endif
 
 static int sys_landlock_create_ruleset(const struct landlock_ruleset_attr *a,
@@ -334,6 +369,13 @@ static int landlock_apply_linux(const char *agent_name,
                  "landlock unsupported: %s", strerror(errno));
         return -1;
     }
+    if (abi < 3) {
+        st->landlock_status = ENF_STATUS_UNAVAILABLE;
+        snprintf(st->reason, sizeof(st->reason),
+                 "Landlock ABI 3 required to restrict file truncation");
+        errno = ENOTSUP;
+        return -1;
+    }
 
     uint64_t read_mask  = LANDLOCK_ACCESS_FS_READ_FILE |
                           LANDLOCK_ACCESS_FS_READ_DIR;
@@ -348,7 +390,8 @@ static int landlock_apply_linux(const char *agent_name,
                           LANDLOCK_ACCESS_FS_MAKE_BLOCK |
                           LANDLOCK_ACCESS_FS_MAKE_CHAR |
                           LANDLOCK_ACCESS_FS_MAKE_SYM |
-                          (abi >= 2 ? LANDLOCK_ACCESS_FS_REFER : 0);
+                          (abi >= 2 ? LANDLOCK_ACCESS_FS_REFER : 0) |
+                          (abi >= 3 ? LANDLOCK_ACCESS_FS_TRUNCATE : 0);
 
     struct landlock_ruleset_attr attr = {0};
     attr.handled_access_fs = read_mask | write_mask | execute_mask;
@@ -475,6 +518,8 @@ static int seccomp_apply_linux(enforcement_state_t *st)
 
         /* Core IO. */
         SC_ALLOW(__NR_read), SC_ALLOW(__NR_write),
+        /* Dynamic loaders can read ELF program headers with pread64. */
+        SC_ALLOW(__NR_pread64),
         SC_ALLOW(__NR_readv), SC_ALLOW(__NR_writev),
         SC_ALLOW(__NR_close), SC_ALLOW(__NR_lseek),
         SC_ALLOW(__NR_dup), SC_ALLOW(__NR_dup3),
@@ -484,8 +529,13 @@ static int seccomp_apply_linux(enforcement_state_t *st)
 #endif
         SC_ALLOW(__NR_openat),
 #ifdef __NR_stat
-        SC_ALLOW(__NR_stat), SC_ALLOW(__NR_lstat), SC_ALLOW(__NR_fstat),
+        SC_ALLOW(__NR_stat), SC_ALLOW(__NR_lstat),
 #endif
+#ifdef __NR_fstat
+        SC_ALLOW(__NR_fstat),
+#endif
+        SC_ALLOW(__NR_mkdirat), SC_ALLOW(__NR_getcwd),
+        SC_ALLOW(__NR_fsync), SC_ALLOW(__NR_fdatasync),
         SC_ALLOW(__NR_newfstatat), SC_ALLOW(__NR_fstatfs),
         SC_ALLOW(__NR_unlinkat),
         SC_ALLOW(__NR_renameat), SC_ALLOW(__NR_renameat2),
@@ -524,6 +574,19 @@ static int seccomp_apply_linux(enforcement_state_t *st)
         SC_ALLOW(__NR_brk), SC_ALLOW(__NR_madvise),
 
         /* Process/identity. */
+        /* Bootstrap exec is required because the filter is installed before
+         * the runtime starts. Landlock still restricts executable paths. */
+        SC_ALLOW(__NR_execve),
+#ifdef __NR_execveat
+        SC_ALLOW(__NR_execveat),
+#endif
+        SC_ALLOW(__NR_set_tid_address),
+#ifdef __NR_rseq
+        SC_ALLOW(__NR_rseq),
+#endif
+#ifdef __NR_prlimit64
+        SC_ALLOW(__NR_prlimit64),
+#endif
         SC_ALLOW(__NR_getpid), SC_ALLOW(__NR_getppid), SC_ALLOW(__NR_gettid),
         SC_ALLOW(__NR_getuid), SC_ALLOW(__NR_geteuid),
         SC_ALLOW(__NR_getgid), SC_ALLOW(__NR_getegid),
@@ -532,6 +595,10 @@ static int seccomp_apply_linux(enforcement_state_t *st)
         /* Signals. */
         SC_ALLOW(__NR_rt_sigaction), SC_ALLOW(__NR_rt_sigprocmask),
         SC_ALLOW(__NR_rt_sigreturn),
+        SC_ALLOW(__NR_rt_sigsuspend),
+#ifdef __NR_pause
+        SC_ALLOW(__NR_pause),
+#endif
 #ifdef __NR_sigaltstack
         SC_ALLOW(__NR_sigaltstack),
 #endif
@@ -612,8 +679,11 @@ int enforcement_parent_setup(const char *agent_name,
     state->seccomp_status  = ENF_STATUS_INACTIVE;
     state->cgroup_status   = ENF_STATUS_INACTIVE;
 
-    if (spec->cgroup_on) {
-        (void)cgroup_setup_linux(agent_name, spec, state);
+    if (spec->cgroup_on && cgroup_setup_linux(agent_name, spec, state) != 0) {
+        int saved = errno;
+        (void)write_state_file(agent_name, state);
+        errno = saved;
+        return -1;
     }
     return write_state_file(agent_name, state);
 }
@@ -636,15 +706,19 @@ int enforcement_child_apply(const char *agent_name,
         (void)read_small_file(caps_path, caps_buf, sizeof(caps_buf), NULL);
 
     if (spec->fs_mode == ENFORCE_FS_LANDLOCK) {
-        (void)landlock_apply_linux(
+        int rc = landlock_apply_linux(
             agent_name, runtime_path, caps_buf, state
         );
+        if (rc != 0) { (void)write_state_file(agent_name, state); return -1; }
     }
     /* Persist after landlock so the supervisor / inspect see the rule count. */
     (void)write_state_file(agent_name, state);
 
     if (spec->sc_mode == SECCOMP_MINIMAL) {
-        (void)seccomp_apply_linux(state);
+        if (seccomp_apply_linux(state) != 0) {
+            (void)write_state_file(agent_name, state);
+            return -1;
+        }
     }
     (void)write_state_file(agent_name, state);
     return 0;

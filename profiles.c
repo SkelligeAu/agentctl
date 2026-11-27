@@ -85,7 +85,11 @@ static void apply_kv(profile_cfg_t *cfg, const char *k, const char *v)
         if (n > 0) cfg->cgroup_pids_max = n;
     }
     else if (strcmp(k, "CGROUP_CPU_MAX") == 0) {
-        snprintf(cfg->cgroup_cpu_max, sizeof(cfg->cgroup_cpu_max), "%s", v);
+        /* Never turn an oversized invalid value into a valid prefix. */
+        size_t length = strlen(v);
+        if (length >= sizeof(cfg->cgroup_cpu_max))
+            strcpy(cfg->cgroup_cpu_max, "invalid:too-long");
+        else memcpy(cfg->cgroup_cpu_max, v, length + 1);
     }
     /* message_policy, snapshot_policy: silently consumed (labels for now). */
 }
@@ -100,6 +104,10 @@ static void parse_lines(profile_cfg_t *cfg, const char *buf)
         while (llen > 0 && (*line == ' ' || *line == '\t')) { line++; llen--; }
         if (llen > 0 && *line != '#') {
             char tmp[256];
+            if (llen >= sizeof(tmp) && llen > strlen("CGROUP_CPU_MAX") &&
+                !memcmp(line, "CGROUP_CPU_MAX", strlen("CGROUP_CPU_MAX")) &&
+                (line[14] == '=' || line[14] == ' ' || line[14] == '\t'))
+                strcpy(cfg->cgroup_cpu_max, "invalid:too-long");
             if (llen < sizeof(tmp)) {
                 memcpy(tmp, line, llen);
                 tmp[llen] = '\0';
@@ -129,6 +137,7 @@ static void parse_lines(profile_cfg_t *cfg, const char *buf)
 
 static void set_builtin_defaults(profile_cfg_t *cfg)
 {
+    memset(cfg, 0, sizeof(*cfg));
     snprintf(cfg->profile_name, sizeof(cfg->profile_name), "worker");
     cfg->dispatch         = DISPATCH_PERSISTENT;
     cfg->artifact_policy  = ARTIFACT_OVERWRITE;

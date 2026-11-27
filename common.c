@@ -17,6 +17,11 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#include <linux/magic.h>
+#endif
 
 int validate_name(const char *name)
 {
@@ -260,7 +265,8 @@ static const char *leaf_class(const char *leaf)
 {
     static const char *const config_leaves[] = {
         "goal", "policy", "limits", "profile", "config", "exec", "runtime",
-        "desired_state", "enabled", "restart_policy", "transport", NULL
+        "desired_state", "enabled", "restart_policy", "transport",
+        "enforcement.overrides", NULL
     };
     static const char *const runtime_leaves[] = {
         "pid", "status", "supervisor", "restart_count",
@@ -314,6 +320,16 @@ int agent_ensure_layout(const char *name)
         if (a < 0 || b < 0 || (size_t)a >= sizeof(oldp) || (size_t)b >= sizeof(newp)) {
             rc = -1; errno = ENAMETOOLONG; break;
         }
+        /* agent_path may publish its compatibility link before the first
+         * canonical write. Never migrate that link into its own target:
+         * its relative path would then point at the wrong directory. */
+        char link[MAX_PATHBUF], expected[MAX_PATHBUF];
+        ssize_t length = readlink(oldp, link, sizeof(link) - 1);
+        if (length >= 0) {
+            link[length] = '\0';
+            int en = snprintf(expected, sizeof(expected), "%s/%s", klass, e->d_name);
+            if (en > 0 && (size_t)en < sizeof(expected) && !strcmp(link, expected)) continue;
+        } else if (errno == ENOENT) continue; /* another migration won */
         if (lstat(newp, &st) != 0) {
             if (errno != ENOENT || rename(oldp, newp) != 0) { rc = -1; break; }
         }
@@ -523,6 +539,9 @@ int read_message(int fd, agent_msg_hdr *hdr, void *payload_buf)
         else errno = saved;
         return -1;
     }
+    /* This legacy API has no descriptor output. It owns and closes all
+     * ancillary descriptors, even on otherwise valid messages. */
+    for (int i = 0; i < msg.n_fds; i++) close(msg.fds[i]);
     memset(hdr, 0, sizeof(*hdr));
     if (msg.verb)     snprintf(hdr->verb,     sizeof(hdr->verb),     "%s", msg.verb);
     if (msg.reply_to) snprintf(hdr->reply_to, sizeof(hdr->reply_to), "%s", msg.reply_to);
@@ -1159,6 +1178,25 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
                         int *out_broker_fd,
                         int *out_inbox_fd)
 {
+    return spawn_agent_runtime_owned(name, runtime_path, supervisor_label,
+        fs_override, sc_override, cg_override, out_pid, out_broker_fd,
+        out_inbox_fd, NULL);
+}
+
+static void startup_failure(int fd)
+{
+    int error = errno ? errno : EIO;
+    (void)!write(fd, &error, sizeof(error));
+    _exit(127);
+}
+
+int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
+                        const char *supervisor_label,
+                        int fs_override, int sc_override, int cg_override,
+                        pid_t *out_pid, int *out_broker_fd, int *out_inbox_fd,
+                        int *out_cgroup_kill_fd)
+{
+    if (out_cgroup_kill_fd) *out_cgroup_kill_fd = -1;
     if (out_broker_fd) *out_broker_fd = -1;
     if (out_inbox_fd) *out_inbox_fd = -1;
     if (validate_name(name) != 0) { errno = EINVAL; return -1; }
@@ -1189,6 +1227,18 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
     profile_load_for_agent(name, &pcfg);
     enforcement_spec_t spec;
     memset(&spec, 0, sizeof(spec));
+    char overrides[128];
+    if (read_agent_setting(name, "enforcement.overrides", overrides, sizeof(overrides)) == 0) {
+        int fs, sc, cg;
+        if (sscanf(overrides, "fs=%d seccomp=%d cgroup=%d", &fs, &sc, &cg) != 3 ||
+            fs < -1 || fs > 1 || sc < -1 || sc > 1 || cg < -1 || cg > 1) {
+            if (audit_fd >= 0) close(audit_fd);
+            errno = EINVAL; return -1;
+        }
+        if (fs_override < 0) fs_override = fs;
+        if (sc_override < 0) sc_override = sc;
+        if (cg_override < 0) cg_override = cg;
+    }
     int fs_on = (fs_override >= 0) ? fs_override : pcfg.enforce_fs;
     int sc_on = (sc_override >= 0) ? sc_override : pcfg.seccomp;
     int cg_on = (cg_override >= 0) ? cg_override : pcfg.cgroup;
@@ -1201,7 +1251,18 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
 
     enforcement_write_req(name, &spec);
     enforcement_state_t enf;
-    enforcement_parent_setup(name, &spec, &enf);
+    int setup_rc = enforcement_parent_setup(name, &spec, &enf);
+    /* No explicit limits retains the documented opportunistic cgroup
+     * fallback. Configured limits must never silently become unlimited. */
+    if (setup_rc != 0 && (enf.cgroup_status != ENF_STATUS_UNAVAILABLE ||
+            spec.cg_memory_max > 0 || spec.cg_pids_max > 0 || spec.cg_cpu_max[0])) {
+        int saved = errno;
+        audit_log(name, "cgroup setup failed: %s", enf.reason);
+        if (audit_fd >= 0) close(audit_fd);
+        write_status(name, "failed");
+        errno = saved;
+        return -1;
+    }
 
     audit_log(name, "%s: enforcement requested fs=%s seccomp=%s cgroup=%s",
               supervisor_label ? supervisor_label : "direct",
@@ -1277,6 +1338,21 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
         }
     }
 
+    /* CLOEXEC error pipe distinguishes successful exec from bootstrap
+     * failure. Keep both ends above the documented runtime fd slots. */
+    int startup[2];
+    if (pipe(startup) != 0) goto setup_failed;
+    for (int i = 0; i < 2; i++) {
+        int moved = fcntl(startup[i], F_DUPFD_CLOEXEC, 6);
+        if (moved < 0) {
+            int saved = errno;
+            close(startup[0]); close(startup[1]); errno = saved;
+            goto setup_failed;
+        }
+        close(startup[i]); startup[i] = moved;
+    }
+    int cgroup_kill_fd = enf.cgroup_status == ENF_STATUS_ACTIVE
+                            ? lifecycle_cgroup_open(enf.cgroup_path) : -1;
     pid_t pid = fork();
     if (pid < 0) {
         int saved = errno;
@@ -1284,13 +1360,17 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
         if (broker_sv[0] >= 0) { close(broker_sv[0]); close(broker_sv[1]); }
         if (inbox_sv[0] >= 0) { close(inbox_sv[0]); close(inbox_sv[1]); }
         if (broker_lock_fd >= 0) close(broker_lock_fd);
+        close(startup[0]); close(startup[1]);
+        if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
         errno = saved;
         return -1;
     }
     if (pid == 0) {
         /* child */
-        if (setsid() == -1) _exit(127);
-        if (chdir(data_dir) == -1) _exit(127);
+        close(startup[0]);
+        if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
+        if (setsid() == -1) startup_failure(startup[1]);
+        if (chdir(data_dir) == -1) startup_failure(startup[1]);
         int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (devnull != -1) { dup2(devnull, 0); close(devnull); }
         if (audit_fd != -1) { dup2(audit_fd, 1); dup2(audit_fd, 2); close(audit_fd); }
@@ -1298,14 +1378,14 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
          * O_CLOEXEC so it survives execl. Close the parent-end copy. */
         if (broker_sv[1] >= 0) {
             close(broker_sv[0]);
-            if (dup2(broker_sv[1], 3) != 3) _exit(127);
+            if (dup2(broker_sv[1], 3) != 3) startup_failure(startup[1]);
             int fl = fcntl(3, F_GETFD);
             if (fl != -1) fcntl(3, F_SETFD, fl & ~FD_CLOEXEC);
             if (broker_sv[1] != 3) close(broker_sv[1]);
         }
         if (inbox_sv[1] >= 0) {
             close(inbox_sv[0]);
-            if (dup2(inbox_sv[1], INBOX_FD_SLOT) != INBOX_FD_SLOT) _exit(127);
+            if (dup2(inbox_sv[1], INBOX_FD_SLOT) != INBOX_FD_SLOT) startup_failure(startup[1]);
             int fl = fcntl(INBOX_FD_SLOT, F_GETFD);
             if (fl != -1) fcntl(INBOX_FD_SLOT, F_SETFD, fl & ~FD_CLOEXEC);
             if (inbox_sv[1] != INBOX_FD_SLOT) close(inbox_sv[1]);
@@ -1313,7 +1393,7 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
         }
         if (broker_lock_fd >= 0) {
             if (dup2(broker_lock_fd, BROKER_LOCK_FD_SLOT) != BROKER_LOCK_FD_SLOT)
-                _exit(127);
+                startup_failure(startup[1]);
             int fl = fcntl(BROKER_LOCK_FD_SLOT, F_GETFD);
             if (fl != -1)
                 fcntl(BROKER_LOCK_FD_SLOT, F_SETFD, fl & ~FD_CLOEXEC);
@@ -1323,11 +1403,13 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
         char limits_path[MAX_PATHBUF];
         if (agent_path(limits_path, sizeof(limits_path), name, "limits") == 0)
             apply_limits_from_file(limits_path);
-        (void)enforcement_child_apply(name, runtime_abs, &spec, &enf);
+        if (enforcement_child_apply(name, runtime_abs, &spec, &enf) != 0)
+            startup_failure(startup[1]);
         char argv0[MAX_NAME + 16];
         int an = snprintf(argv0, sizeof(argv0), "agent:%s", name);
-        if (an < 0 || (size_t)an >= sizeof(argv0)) _exit(127);
+        if (an < 0 || (size_t)an >= sizeof(argv0)) { errno = EINVAL; startup_failure(startup[1]); }
         execl(runtime_abs, argv0, name, (char *)NULL);
+        int exec_errno = errno;
         char exec_error[256];
         int exec_error_len = snprintf(
             exec_error, sizeof(exec_error),
@@ -1336,9 +1418,11 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
         );
         if (exec_error_len > 0)
             (void)!write(2, exec_error, (size_t)exec_error_len);
-        _exit(127);
+        errno = exec_errno;
+        startup_failure(startup[1]);
     }
     /* parent */
+    close(startup[1]);
     if (audit_fd != -1) close(audit_fd);
     if (broker_sv[0] >= 0) {
         close(broker_sv[1]);          /* child's end stays in the child */
@@ -1350,14 +1434,22 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
     }
     if (broker_lock_fd >= 0) close(broker_lock_fd);
 
+    (void)enforcement_parent_attach_pid(&enf, pid);
+    int child_error = EIO;
+    ssize_t startup_read = read_all(startup[0], &child_error, sizeof(child_error));
+    close(startup[0]);
+    if (startup_read != 0) {
+        errno = startup_read == sizeof(child_error) ? child_error : EIO;
+        goto child_failed;
+    }
+
     char pidbuf[32];
     int rl = snprintf(pidbuf, sizeof(pidbuf), "%ld\n", (long)pid);
-    if (rl < 0 || (size_t)rl >= sizeof(pidbuf)) return -1;
+    if (rl < 0 || (size_t)rl >= sizeof(pidbuf)) { errno = EOVERFLOW; goto child_failed; }
     char pid_path[MAX_PATHBUF];
-    if (agent_path(pid_path, sizeof(pid_path), name, "pid") != 0) return -1;
-    if (atomic_write_file(pid_path, pidbuf, (size_t)rl, 0600) != 0) return -1;
+    if (agent_path(pid_path, sizeof(pid_path), name, "pid") != 0) goto child_failed;
+    if (atomic_write_file(pid_path, pidbuf, (size_t)rl, 0600) != 0) goto child_failed;
 
-    (void)enforcement_parent_attach_pid(&enf, pid);
     audit_log(name, "%s forked pid=%ld pgid=%ld runtime=%s",
               supervisor_label ? supervisor_label : "direct",
               (long)pid, (long)pid, runtime_abs);
@@ -1383,7 +1475,32 @@ int spawn_agent_runtime(const char *name, const char *runtime_path,
     }
 
     if (out_pid) *out_pid = pid;
+    if (out_cgroup_kill_fd) *out_cgroup_kill_fd = cgroup_kill_fd;
+    else if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
     return 0;
+child_failed:
+    {
+        int saved = errno;
+        (void)kill(pid, SIGKILL);
+        (void)lifecycle_signal_group(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        if (out_broker_fd && *out_broker_fd >= 0) { close(*out_broker_fd); *out_broker_fd = -1; }
+        if (out_inbox_fd && *out_inbox_fd >= 0) { close(*out_inbox_fd); *out_inbox_fd = -1; }
+        if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
+        write_status(name, "failed");
+        errno = saved;
+        return -1;
+    }
+setup_failed:
+    {
+        int saved = errno;
+        if (audit_fd >= 0) close(audit_fd);
+        if (broker_sv[0] >= 0) { close(broker_sv[0]); close(broker_sv[1]); }
+        if (inbox_sv[0] >= 0) { close(inbox_sv[0]); close(inbox_sv[1]); }
+        if (broker_lock_fd >= 0) close(broker_lock_fd);
+        errno = saved;
+        return -1;
+    }
 }
 
 /* ---------- ---------- */
@@ -1473,23 +1590,33 @@ int lifecycle_signal_group(pid_t pgid, int sig)
     return killpg(pgid, sig);
 }
 
-int lifecycle_cgroup_kill(const char *cgroup_path)
+int lifecycle_cgroup_open(const char *cgroup_path)
 {
 #if defined(__linux__)
     if (!cgroup_path || !*cgroup_path) { errno = EINVAL; return -1; }
-    char path[MAX_PATHBUF];
-    int n = snprintf(path, sizeof(path), "%s/cgroup.kill", cgroup_path);
-    if (n < 0 || (size_t)n >= sizeof(path)) { errno = ENAMETOOLONG; return -1; }
-    int fd = open(path, O_WRONLY | O_CLOEXEC);
-    if (fd == -1) return -1;  /* ENOENT = unsupported / cgroup gone */
-    ssize_t w = write(fd, "1\n", 2);
-    int saved = errno;
-    close(fd);
-    if (w < 0) { errno = saved; return -1; }
-    return 0;
+    int dir = open(cgroup_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) return -1;
+    struct statfs fs;
+    if (fstatfs(dir, &fs) != 0 || fs.f_type != CGROUP2_SUPER_MAGIC) {
+        close(dir); errno = EINVAL; return -1;
+    }
+    int fd = openat(dir, "cgroup.kill", O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    int saved = errno; close(dir); errno = saved;
+    return fd;
 #else
     (void)cgroup_path;
     errno = ENOSYS;
     return -1;
 #endif
+}
+
+int lifecycle_cgroup_kill(const char *cgroup_path)
+{
+    int fd = lifecycle_cgroup_open(cgroup_path);
+    if (fd < 0) return -1;
+    ssize_t n = write(fd, "1\n", 2);
+    int saved = errno;
+    close(fd);
+    if (n != 2) { errno = n < 0 ? saved : EIO; return -1; }
+    return 0;
 }

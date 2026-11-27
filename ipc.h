@@ -111,6 +111,8 @@ int  ipc_send(int fd, const ipc_msg_t *msg);
  * `bufcap` should be IPC_MSG_DEFAULT_CAP (64 KiB) for typical agents or
  * IPC_BUF_CAP for agents that must handle 1 MiB messages.
  * On IPC_OK, out_msg pointers refer into buf and out_msg->peer is filled.
+ * The caller owns returned fds only on IPC_OK. Other returns close every
+ * installed descriptor and leave out_msg->n_fds zero.
  * Returns IPC_OK, IPC_ERR, IPC_PEER_GONE (EOF), or IPC_PROTO_VIOLATION. */
 int  ipc_recv(int fd, void *buf, size_t bufcap, ipc_msg_t *out_msg);
 
