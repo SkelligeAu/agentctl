@@ -181,5 +181,19 @@ It does not provide cryptographic audit integrity or unguessable audit correlati
 It does not prevent applications from forwarding descriptors to other processes.
 
 Process-group cleanup tests do not establish cgroup containment.
-Cgroup tests do not clear the post-fork attachment race or validate supervisor recovery.
+Cgroup tests do not cover parent death at the startup gate or validate supervisor recovery.
 See [SECURITY.md](../SECURITY.md).
+
+## Bounded acquisition and startup regressions
+
+On Linux, `make tests` also builds `test_broker_timeout`; `run-all.sh` runs it.
+It checks a silent broker, process and thread lock contention, successful timed
+acquisition, close-on-exec delivery and refusal of late replies after shutdown.
+The runtime suite checks file-specific Landlock grants, denial for a sibling
+file, and the stopped state after failed starts with restart policy `never`.
+The CLI test helper sends explicit empty input so it cannot wait on a terminal.
+
+A separate disposable ARM64 Linux fixture checks actual cgroup attachment,
+CPU throttling, memory and PID ceilings, detached-process cleanup and a bounded
+JVM-to-Rust exchange. This is not hosted deployment qualification. Parent-death
+fault injection at the startup gate remains a follow-up.

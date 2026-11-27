@@ -94,6 +94,11 @@ int  ipc_accept(int server_fd, peer_id_t *out_peer);
  * falls back to a pathname connection. */
 int  ipc_connect(const char *target);
 
+/* Supervised-only bounded acquisition, including broker locks. No pathname
+ * fallback. A failed in-flight exchange shuts down the broker channel so a late
+ * reply cannot be mistaken for a later request. Existing ipc_connect is unchanged. */
+int ipc_connect_timeout(const char *target, unsigned timeout_ms);
+
 /* Close the listener and unlink the socket path. */
 void ipc_close_listener(int server_fd, const char *agent_name);
 

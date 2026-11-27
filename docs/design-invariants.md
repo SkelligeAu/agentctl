@@ -148,8 +148,10 @@ Invalid CPU quota syntax or a failed limit write prevents runtime creation.
 The applied state records cgroup enforcement as unavailable.
 
 Without configured limits, an unavailable cgroup hierarchy retains the process-group fallback.
-Cgroup attachment occurs after `fork`, without a child startup barrier.
-The child can execute or fork before attachment.
+Cgroup attachment occurs after `fork`. The child waits on a pipe until the
+parent confirms successful attachment. Active enforcement also requires a
+parent-owned cgroup kill descriptor. Failed attachment refuses runtime entry.
+Parent-death fault injection at this gate is still outstanding.
 
 The minimal seccomp filter permits runtime execution and libc startup calls.
 It is not an exec-once policy.

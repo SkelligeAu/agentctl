@@ -1353,6 +1353,18 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
     }
     int cgroup_kill_fd = enf.cgroup_status == ENF_STATUS_ACTIVE
                             ? lifecycle_cgroup_open(enf.cgroup_path) : -1;
+    if (enf.cgroup_status == ENF_STATUS_ACTIVE && cgroup_kill_fd < 0) {
+        close(startup[0]); close(startup[1]);
+        goto setup_failed;
+    }
+    /* Child cannot execute or fork until attachment succeeds. Parent death
+     * closes the gate and makes the child fail before runtime execution. */
+    int gate[2];
+    if (pipe(gate) != 0) {
+        close(startup[0]); close(startup[1]);
+        if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
+        goto setup_failed;
+    }
     pid_t pid = fork();
     if (pid < 0) {
         int saved = errno;
@@ -1361,6 +1373,7 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
         if (inbox_sv[0] >= 0) { close(inbox_sv[0]); close(inbox_sv[1]); }
         if (broker_lock_fd >= 0) close(broker_lock_fd);
         close(startup[0]); close(startup[1]);
+        close(gate[0]); close(gate[1]);
         if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
         errno = saved;
         return -1;
@@ -1368,6 +1381,12 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
     if (pid == 0) {
         /* child */
         close(startup[0]);
+        close(gate[1]);
+        char admitted = 0;
+        if (read_all(gate[0], &admitted, 1) != 1 || admitted != '1') {
+            errno = ECANCELED; startup_failure(startup[1]);
+        }
+        close(gate[0]);
         if (cgroup_kill_fd >= 0) close(cgroup_kill_fd);
         if (setsid() == -1) startup_failure(startup[1]);
         if (chdir(data_dir) == -1) startup_failure(startup[1]);
@@ -1434,7 +1453,16 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
     }
     if (broker_lock_fd >= 0) close(broker_lock_fd);
 
-    (void)enforcement_parent_attach_pid(&enf, pid);
+    close(gate[0]);
+    if (enforcement_parent_attach_pid(&enf, pid) != 0) {
+        close(gate[1]); close(startup[0]);
+        goto child_failed;
+    }
+    if (write_all(gate[1], "1", 1) != 1) {
+        close(gate[1]); close(startup[0]);
+        goto child_failed;
+    }
+    close(gate[1]);
     int child_error = EIO;
     ssize_t startup_read = read_all(startup[0], &child_error, sizeof(child_error));
     close(startup[0]);
@@ -1481,6 +1509,7 @@ int spawn_agent_runtime_owned(const char *name, const char *runtime_path,
 child_failed:
     {
         int saved = errno;
+        if (cgroup_kill_fd >= 0) (void)write_all(cgroup_kill_fd, "1\n", 2);
         (void)kill(pid, SIGKILL);
         (void)lifecycle_signal_group(pid, SIGKILL);
         while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}

@@ -231,10 +231,16 @@ Cleanup and CLI kill do not take cgroup authority from the child-writable `enfor
 Writing `cgroup.kill` terminates processes in that cgroup and its descendants.
 The process-group fallback cannot terminate children that create another session.
 
-Cgroup attachment occurs after `fork`.
-There is no startup barrier between the parent and child.
-A child can execute or fork before attachment.
-Configured limits do not remove this race.
+Cgroup attachment occurs after `fork`. The child waits on a startup pipe before
+it applies runtime settings or executes the runtime. The parent releases this
+gate only after attachment succeeds. Active cgroup enforcement also requires a
+parent-owned kill descriptor. A failed attachment refuses startup. Startup
+failure attempts cleanup through that descriptor as well as the process group.
+
+The Linux fixture checks runtime-entry membership and refusal on attachment
+failure. Parent death while the gate is closed has not yet been fault-injected.
+A failed cgroup kill still needs an outer host watchdog; this change does not
+turn cleanup errors into a guarantee that no process survives.
 
 Supervisor recovery starts from a PID stored on disk.
 That PID can be changed or reused before the supervisor opens a pidfd.
@@ -267,3 +273,17 @@ There is no dedicated security response service.
 Report an issue through GitHub or contact the author directly.
 
 Do not use this code for security-sensitive workloads without a separate review of the deployment.
+
+## Timed broker acquisition
+
+`ipc_connect_timeout(target, timeout_ms)` bounds broker acquisition, including
+thread and process lock waits. The supported timeout is 1–60000 milliseconds.
+It requires the inherited supervisor channel and never falls back to a socket
+pathname. An in-flight timeout shuts down that channel so a late descriptor
+cannot become a later request's response. Restart the runtime before reuse.
+A timeout while waiting for the lock does not cancel another caller's exchange.
+This API does not supply a task deadline or terminate the runtime.
+
+The broker remains trusted. Malformed broker-response descriptor handling is
+not fully qualified by the timeout tests. Production isolation must include the
+supervisor inside the outer boundary and enforce task cleanup outside it.

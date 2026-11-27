@@ -56,7 +56,7 @@ class RuntimeRegressions(unittest.TestCase):
         self.temp.cleanup()
 
     def cli(self, *args):
-        result = subprocess.run([str(REPO / "agentctl"), *args], env=self.env,
+        result = subprocess.run([str(REPO / "agentctl"), *args], env=self.env, input="",
                                 capture_output=True, text=True, timeout=12)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -150,6 +150,19 @@ class RuntimeRegressions(unittest.TestCase):
     def landlock_profile(self):
         (self.root / "profiles/worker.profile").write_text(
             "dispatch=persistent\nenforce_fs=landlock\nseccomp=off\ncgroup=off\n")
+
+    def test_landlock_file_grant_does_not_grant_sibling(self):
+        self.landlock_profile()
+        base = self.create("probe", "security-file-grant")
+        (self.root / "allowed-file").write_text("before")
+        (self.root / "denied-file").write_text("keep")
+        self.cli("grant", "probe", "fs.write:/dev/null")
+        self.cli("grant", "probe", "fs.write:" + str(self.root / "allowed-file"))
+        self.start("probe")
+        eventually(lambda: (base / "data/security-ready").exists())
+        self.assertEqual((self.root / "allowed-file").read_text(), "ok")
+        self.assertEqual((self.root / "denied-file").read_text(), "keep")
+        self.assertIn("landlock_status=active", (base / "runtime/enforcement.applied").read_text())
 
     def test_landlock_blocks_token_truncate_but_allows_data(self):
         self.landlock_profile()
@@ -323,6 +336,7 @@ class RuntimeRegressions(unittest.TestCase):
         self.assertFalse(pidfile.exists())
         self.assertFalse((base / "data/security-ready").exists())
         self.assertEqual((base / "runtime/status").read_text().strip(), "failed")
+        self.assertEqual((base / "config/desired_state").read_text().strip(), "stopped")
 
     def test_configured_cpu_limit_cannot_fall_back_when_cgroups_are_readonly(self):
         if os.access("/sys/fs/cgroup", os.W_OK):

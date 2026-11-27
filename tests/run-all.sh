@@ -31,6 +31,10 @@ run_one ipc_fd_cleanup      "$HERE"/test_ipc_fd_cleanup
 run_one cloexec_propagation "$HERE"/test_cloexec
 run_one input_validation   "$HERE"/test_input_validation
 
+if [ "$(uname -s)" = Linux ]; then
+    run_one broker_timeout "$HERE"/test_broker_timeout
+fi
+
 echo "== broker integration tests =="
 for s in broker_default_deny broker_wildcard broker_concurrency broker_malformed \
          broker_msg_ctrunc policy_not_authority broker_no_state; do

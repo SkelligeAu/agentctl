@@ -131,8 +131,10 @@ With cgroup enforcement enabled, configured limits must be written successfully 
 Invalid CPU quotas and failed controller writes return an error.
 Without configured limits, unavailable cgroups retain the process-group fallback.
 
-Cgroup attachment still occurs after `fork`, without a startup barrier.
-This race remains a limit on resource containment.
+Cgroup attachment occurs after `fork`. A startup gate keeps the child from
+executing its runtime until attachment succeeds. Failed attachment refuses
+startup. Parent-death fault injection at this gate remains unverified; retain
+an outer host boundary and independent cleanup watchdog.
 
 ## Configure network access
 

@@ -44,7 +44,20 @@ int main(int argc, char **argv)
     FILE *f = fopen("mode", "r");
     if (f) { (void)fscanf(f, "%31s", mode); fclose(f); }
     write_status(argv[1], "idle");
-    if (!strcmp(mode, "security-truncate")) {
+    if (!strcmp(mode, "security-file-grant")) {
+        char path[MAX_PATHBUF];
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd < 0 || write(fd, "x", 1) != 1) return 4;
+        close(fd);
+        snprintf(path, sizeof(path), "%s/allowed-file", agentctl_root());
+        fd = open(path, O_WRONLY | O_TRUNC);
+        if (fd < 0 || write(fd, "ok", 2) != 2) return 4;
+        close(fd);
+        snprintf(path, sizeof(path), "%s/denied-file", agentctl_root());
+        fd = open(path, O_WRONLY | O_TRUNC);
+        if (fd >= 0) { close(fd); return 4; }
+        marker("security-ready", "yes");
+    } else if (!strcmp(mode, "security-truncate")) {
         char path[MAX_PATHBUF], result[64];
         snprintf(path, sizeof(path), "%s/agentd.token", agentctl_root());
         int rc = truncate(path, 0);

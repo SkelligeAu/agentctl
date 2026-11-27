@@ -254,6 +254,11 @@ static int spawn_agent(struct managed *m)
                             &m->cgroup_kill_fd) != 0) {
         daemon_log("start %s: spawn failed: %s", m->name, strerror(errno));
         audit_log(m->name, "agentd: spawn failed: %s", strerror(errno));
+        int saved = errno;
+        write_status(m->name, "failed");
+        if (load_policy(m->name) == POLICY_NEVER)
+            write_agent_setting(m->name, "desired_state", "stopped");
+        errno = saved;
         return -1;
     }
     m->pid = pid;

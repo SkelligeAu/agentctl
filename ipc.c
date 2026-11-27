@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,27 @@
  * fd 5 supplies a POSIX record lock that serializes distinct processes. */
 static volatile int g_broker_thread_lock = 0;
 
-static int broker_exchange_lock(void)
+static long broker_now_ms(void)
+{
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return -1;
+    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static int broker_wait(int fd, short events, long deadline)
+{
+    for (;;) {
+        long left = deadline - broker_now_ms();
+        if (left <= 0) { errno = ETIMEDOUT; return -1; }
+        struct pollfd p = { fd, events, 0 };
+        int rc = poll(&p, 1, (int)left);
+        if (rc > 0) return 0;
+        if (rc == 0) { errno = ETIMEDOUT; return -1; }
+        if (errno != EINTR) return -1;
+    }
+}
+
+static int broker_exchange_lock(long deadline)
 {
     const char *marker = getenv("AGENTCTL_BROKER_LOCK_FD");
     if (!marker || strcmp(marker, "5") != 0 ||
@@ -41,6 +62,7 @@ static int broker_exchange_lock(void)
         return -1;
     }
     while (__sync_lock_test_and_set(&g_broker_thread_lock, 1)) {
+        if (deadline && broker_now_ms() >= deadline) { errno = ETIMEDOUT; return -1; }
         struct timespec ts = { 0, 1000L * 1000L };
         nanosleep(&ts, NULL);
     }
@@ -49,8 +71,15 @@ static int broker_exchange_lock(void)
     lk.l_type = F_WRLCK;
     lk.l_whence = SEEK_SET;
     int rc;
-    do { rc = fcntl(BROKER_LOCK_FD_SLOT, F_SETLKW, &lk); }
-    while (rc < 0 && errno == EINTR);
+    do {
+        rc = fcntl(BROKER_LOCK_FD_SLOT, deadline ? F_SETLK : F_SETLKW, &lk);
+        if (rc == 0) break;
+        if (deadline && (errno == EAGAIN || errno == EACCES || errno == EINTR)) {
+            if (broker_now_ms() >= deadline) { errno = ETIMEDOUT; break; }
+            struct timespec ts = { 0, 1000000L };
+            nanosleep(&ts, NULL);
+        } else if (errno != EINTR) break;
+    } while (rc < 0);
     if (rc < 0) __sync_lock_release(&g_broker_thread_lock);
     return rc;
 }
@@ -243,7 +272,7 @@ int ipc_accept(int server_fd, peer_id_t *out_peer)
     return cfd;
 }
 
-int ipc_connect(const char *target)
+static int ipc_connect_impl(const char *target, long deadline)
 {
     /* Supervised runtimes never know a mailbox pathname. Acquire a fresh
      * connected capability through their inherited broker channel. */
@@ -252,12 +281,14 @@ int ipc_connect(const char *target)
         getsockopt(BROKER_FD_SLOT, SOL_SOCKET, SO_TYPE,
                    &broker_type, &broker_type_len) == 0) {
         if (validate_name(target) != 0) { errno = EINVAL; return IPC_ERR; }
-        if (broker_exchange_lock() != 0) return IPC_ERR;
+        if (broker_exchange_lock(deadline) != 0) return IPC_ERR;
         char req[256];
         int rn = snprintf(req, sizeof(req),
                           "VERB request\nCAP mailbox.send:%s\nREASON libagentctl\n\n",
                           target);
-        if (rn <= 0 || send(BROKER_FD_SLOT, req, (size_t)rn, 0) < 0) {
+        if (rn <= 0 || (deadline && broker_wait(BROKER_FD_SLOT, POLLOUT, deadline)) ||
+            send(BROKER_FD_SLOT, req, (size_t)rn, MSG_NOSIGNAL | (deadline ? MSG_DONTWAIT : 0)) != rn) {
+            if (deadline) (void)shutdown(BROKER_FD_SLOT, SHUT_RDWR);
             broker_exchange_unlock();
             return IPC_ERR;
         }
@@ -267,9 +298,15 @@ int ipc_connect(const char *target)
         memset(&mh, 0, sizeof(mh)); mh.msg_iov = &iov; mh.msg_iovlen = 1;
         mh.msg_control = control; mh.msg_controllen = sizeof(control);
         ssize_t got;
-        do { got = recvmsg(BROKER_FD_SLOT, &mh, MSG_CMSG_CLOEXEC); }
-        while (got < 0 && errno == EINTR);
-        if (got <= 0) { broker_exchange_unlock(); return IPC_ERR; }
+        do {
+            if (deadline && broker_wait(BROKER_FD_SLOT, POLLIN, deadline)) { got = -1; break; }
+            got = recvmsg(BROKER_FD_SLOT, &mh, MSG_CMSG_CLOEXEC | (deadline ? MSG_DONTWAIT : 0));
+        } while (got < 0 && (errno == EINTR || (deadline && errno == EAGAIN)));
+        if (got <= 0) {
+            int saved = errno;
+            if (deadline) (void)shutdown(BROKER_FD_SLOT, SHUT_RDWR);
+            broker_exchange_unlock(); errno = saved; return IPC_ERR;
+        }
         int issued = -1;
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
             if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
@@ -284,6 +321,7 @@ int ipc_connect(const char *target)
         broker_exchange_unlock();
         return issued;
     }
+    if (deadline) { errno = ENOTCONN; return IPC_ERR; }
     char path[MAX_PATHBUF];
     if (sock_path_for(target, path, sizeof(path)) != 0) return IPC_ERR;
     int fd = socket(AF_UNIX, IPC_SOCK_TYPE | SOCK_CLOEXEC, 0);
@@ -304,6 +342,19 @@ int ipc_connect(const char *target)
     /* Leave fd in blocking mode; ipc_send uses MSG_DONTWAIT per-call so
      * callers can read replies normally without juggling fd flags. */
     return fd;
+}
+
+int ipc_connect(const char *target)
+{
+    return ipc_connect_impl(target, 0);
+}
+
+int ipc_connect_timeout(const char *target, unsigned timeout_ms)
+{
+    if (!timeout_ms || timeout_ms > 60000) { errno = EINVAL; return IPC_ERR; }
+    long now = broker_now_ms();
+    if (now < 0) return IPC_ERR;
+    return ipc_connect_impl(target, now + timeout_ms);
 }
 
 void ipc_close_listener(int server_fd, const char *agent_name)

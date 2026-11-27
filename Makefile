@@ -6,6 +6,10 @@ LDFLAGS ?=
 BINS = agentctl agentd reviewer-agent fanout-agent psa broker-test broker-fault broker-concurrency
 TESTS = tests/test_ipc_msg_trunc tests/test_ipc_msg_ctrunc tests/test_cloexec \
 	tests/test_input_validation tests/test_ipc_fd_cleanup tests/phase1-probe tests/crash-agent tests/runtime-regression
+ifeq ($(shell uname -s),Linux)
+TESTS += tests/test_broker_timeout
+endif
+
 LIBOBJS = common.o ipc.o broker.o profiles.o tasks.o enforcement.o
 LIB = libagentctl.a
 FUZZ_CC ?= clang
@@ -58,6 +62,9 @@ broker-fault: examples/broker-fault.c
 
 broker-concurrency: examples/broker-concurrency.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ examples/broker-concurrency.c $(LIBOBJS)
+
+tests/test_broker_timeout: tests/test_broker_timeout.c $(LIBOBJS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -pthread -o $@ tests/test_broker_timeout.c $(LIBOBJS)
 
 tests/test_ipc_msg_trunc: tests/test_ipc_msg_trunc.c $(LIBOBJS)
 	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ tests/test_ipc_msg_trunc.c $(LIBOBJS)

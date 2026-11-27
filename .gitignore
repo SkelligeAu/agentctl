@@ -90,3 +90,5 @@ __pycache__/
 *.pid
 agentd.log
 audit.log
+
+tests/test_broker_timeout

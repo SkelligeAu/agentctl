@@ -337,6 +337,12 @@ static int add_path_rule(struct ll_ctx *c, const char *path, uint64_t access)
     int fd = open(path, O_PATH | O_CLOEXEC);
     if (fd == -1) return -1;
     struct landlock_path_beneath_attr a = {0};
+    /* Directory-only rights make a file-anchored rule invalid. */
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    if (!S_ISDIR(st.st_mode))
+        access &= LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
+                  LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_TRUNCATE;
     a.allowed_access = access;
     a.parent_fd = fd;
     int rc = sys_landlock_add_rule(c->rsfd, LANDLOCK_RULE_PATH_BENEATH, &a, 0);
